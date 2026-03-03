@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("fm_mcp")
+
+
+def _find_sherpa_entry(
+    entries: List[Dict[str, Any]],
+    sherpa_hint: str,
+    name_key: str = "sherpa_name",
+) -> Optional[Dict[str, Any]]:
+    """Fuzzy match by startswith/contains for things like tug-104 -> tug-104-ceat-nagpur-11."""
+    hint = (sherpa_hint or "").strip().lower()
+    if not hint:
+        return None
+
+    # Exact
+    for e in entries:
+        if str(e.get(name_key, "")).lower() == hint:
+            return e
+
+    # Startswith
+    for e in entries:
+        if str(e.get(name_key, "")).lower().startswith(hint):
+            return e
+
+    # Contains
+    for e in entries:
+        if hint in str(e.get(name_key, "")).lower():
+            return e
+
+    return None
+
+
+def summarize_basic_analytics(payload: Dict[str, Any]) -> str:
+    # Use inner payload if API returns { "data": { ... } }
+    if isinstance(payload.get("data"), dict):
+        payload = payload["data"]
+    total_trips = payload.get("total_trips")
+    total_distance = payload.get("total_distance_km")
+
+    lines: List[str] = []
+    lines.append(f"Total trips: {total_trips}")
+    lines.append(f"Total distance (km): {total_distance}")
+
+    # Top trips
+    st = payload.get("sherpa_wise_trips") or []
+    if st:
+        top = sorted(st, key=lambda x: x.get("trip_count", 0), reverse=True)[:5]
+        lines.append("\nTrips by Sherpa (top 5):")
+        for r in top:
+            lines.append(f"- {r.get('sherpa_name')}: {r.get('trip_count')}")
+
+    # Availability (per sherpa)
+    av = payload.get("availability") or []
+    if av:
+        lines.append("\nAvailability:")
+        for r in av:
+            val = r.get("availability_percentage") or r.get("availability", "")
+            lines.append(f"- {r.get('sherpa_name')}: {val}")
+
+    # Utilization (per sherpa)
+    util = payload.get("utilization") or []
+    if util:
+        lines.append("\nUtilization:")
+        for r in util:
+            lines.append(f"- {r.get('sherpa_name')}: {r.get('utilization')}")
+
+    # Sherpa-wise distance
+    swd = payload.get("sherpa_wise_distance") or []
+    if swd:
+        lines.append("\nSherpa-wise distance:")
+        for r in swd:
+            dist = r.get("distance_km") or r.get("total_distance_km") or r.get("distance", 0)
+            lines.append(f"- {r.get('sherpa_name')}: {dist}")
+
+    # Takt time per sherpa
+    takt = payload.get("avg_takt_per_sherpa") or []
+    if takt:
+        lines.append("\nAverage Takt Time per Sherpa (minutes):")
+        for r in sorted(takt, key=lambda x: x.get("avg_takt_time_minutes", 0), reverse=True)[:10]:
+            sherpa = r.get("sherpa", "Unknown")
+            avg_takt = r.get("avg_takt_time_minutes", 0)
+            min_takt = r.get("min_takt_time_minutes", 0)
+            max_takt = r.get("max_takt_time_minutes", 0)
+            trips = r.get("total_trips", 0)
+            lines.append(f"- {sherpa}: avg={avg_takt:.2f} min (min={min_takt:.2f}, max={max_takt:.2f}), trips={trips}")
+
+    return "\n".join(lines)
+
+
+def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional[str] = None) -> Tuple[Any, str]:
+    """Return (value, note). Note explains any fuzzy match applied."""
+    item = (item or "").strip()
+    note = ""
+
+    # Handle total_distance_km - check sherpa_wise_distance first (even if no sherpa hint)
+    # This allows returning all sherpas when sherpa_hint is None
+    if item in ("total_distance_km", "total_distance", "distance"):
+        if sherpa_hint:
+            entries = payload.get("sherpa_wise_distance") or []
+            e = _find_sherpa_entry(entries, sherpa_hint)
+            if e:
+                if str(e.get('sherpa_name','')).lower() != sherpa_hint.lower():
+                    note = f"Matched '{sherpa_hint}' to '{e.get('sherpa_name')}'."
+                return e.get("distance_km") or e.get("total_distance_km") or e.get("distance"), note
+            return 0, f"No matching Sherpa found in sherpa_wise_distance list."
+        # No sherpa hint - prefer top-level total_distance_km if available
+        # The API returns total_distance_km at the top level when querying all sherpas
+        top_level_total = payload.get("total_distance_km") or payload.get("total_distance") or payload.get("distance")
+        if top_level_total is not None and top_level_total != 0:
+            return top_level_total, note
+        
+        # If top-level is 0 or missing, try summing sherpa_wise_distance
+        entries = payload.get("sherpa_wise_distance") or []
+        if entries:
+            total = 0.0
+            for entry in entries:
+                distance = entry.get("distance_km") or entry.get("total_distance_km") or entry.get("distance", 0)
+                if isinstance(distance, (int, float)):
+                    total += float(distance)
+            if total > 0:
+                return total, "Sum of all sherpas"
+        
+        # Fallback to top-level value (even if 0)
+        return top_level_total if top_level_total is not None else 0, note
+
+    # Handle total_trips - check sherpa_wise_trips first (even if no sherpa hint)
+    # This allows returning all sherpas when sherpa_hint is None
+    if item in ("total_trips", "trips"):
+        if sherpa_hint:
+            entries = payload.get("sherpa_wise_trips") or []
+            e = _find_sherpa_entry(entries, sherpa_hint)
+            if e:
+                if str(e.get('sherpa_name','')).lower() != sherpa_hint.lower():
+                    note = f"Matched '{sherpa_hint}' to '{e.get('sherpa_name')}'."
+                return e.get("trip_count") or e.get("total_trips") or e.get("trips"), note
+            return 0, f"No matching Sherpa found in sherpa_wise_trips list."
+        # No sherpa hint - return all sherpas as comma-separated values
+        entries = payload.get("sherpa_wise_trips") or []
+        if entries:
+            sherpa_values = []
+            for entry in entries:
+                sherpa_name = entry.get("sherpa_name", "Unknown")
+                trip_count = entry.get("trip_count") or entry.get("total_trips") or entry.get("trips", 0)
+                sherpa_values.append(f"{sherpa_name}: {trip_count}")
+            return ", ".join(sherpa_values), "All sherpas"
+        # Fallback to total if sherpa_wise_trips not available
+        return payload.get("total_trips"), note
+
+    # Direct top-level keys (for items that don't have sherpa-wise breakdowns)
+    if item in payload and sherpa_hint is None:
+        return payload.get(item), note
+
+    # Normalized mapping for common queries
+    # - uptime, availability, utilization are arrays of {sherpa_name, <metric>}
+    if item in ("uptime", "uptime_percentage"):
+        entries = payload.get("uptime") or []
+        if sherpa_hint:
+            e = _find_sherpa_entry(entries, sherpa_hint)
+            if e:
+                if str(e.get('sherpa_name','')).lower() != sherpa_hint.lower():
+                    note = f"Matched '{sherpa_hint}' to '{e.get('sherpa_name')}'."
+                return e.get("uptime_percentage"), note
+            return 0, "No matching Sherpa found in uptime list."
+        return entries, note
+
+    if item in ("availability", "availability_percentage"):
+        entries = payload.get("availability") or []
+        if sherpa_hint:
+            e = _find_sherpa_entry(entries, sherpa_hint)
+            if e:
+                if str(e.get('sherpa_name','')).lower() != sherpa_hint.lower():
+                    note = f"Matched '{sherpa_hint}' to '{e.get('sherpa_name')}'."
+                return e.get("availability_percentage"), note
+            return 0, "No matching Sherpa found in availability list."
+        return entries, note
+
+    if item in ("utilization",):
+        entries = payload.get("utilization") or []
+        if sherpa_hint:
+            e = _find_sherpa_entry(entries, sherpa_hint)
+            if e:
+                if str(e.get('sherpa_name','')).lower() != sherpa_hint.lower():
+                    note = f"Matched '{sherpa_hint}' to '{e.get('sherpa_name')}'."
+                return e.get("utilization"), note
+            return 0, "No matching Sherpa found in utilization list."
+        return entries, note
+
+    if item in ("battery", "battery_level"):
+        entries = payload.get("sherpa_status") or []
+        if sherpa_hint:
+            e = _find_sherpa_entry(entries, sherpa_hint)
+            if e:
+                if str(e.get('sherpa_name','')).lower() != sherpa_hint.lower():
+                    note = f"Matched '{sherpa_hint}' to '{e.get('sherpa_name')}'."
+                return e.get("battery_level"), note
+            return 0, "No matching Sherpa found in sherpa_status list."
+        return entries, note
+
+    # Handle takt_time - API returns avg_takt_per_sherpa from route_analytics
+    if item in ("takt_time", "average_takt_time", "takt", "avg_takt_time"):
+        # API returns avg_takt_per_sherpa array
+        entries = payload.get("avg_takt_per_sherpa") or []
+        if isinstance(entries, list):
+            if sherpa_hint:
+                # Find matching sherpa (note: API uses "sherpa" not "sherpa_name")
+                e = _find_sherpa_entry(entries, sherpa_hint, name_key="sherpa")
+                if e:
+                    sherpa_name = e.get("sherpa", "")
+                    if str(sherpa_name).lower() != sherpa_hint.lower():
+                        note = f"Matched '{sherpa_hint}' to '{sherpa_name}'."
+                    # Return avg_takt_time_minutes (primary metric)
+                    avg_takt = e.get("avg_takt_time_minutes")
+                    if avg_takt is not None:
+                        return avg_takt, note
+                    # Fallback to other takt time fields
+                    return e.get("min_takt_time_minutes") or e.get("max_takt_time_minutes"), note
+                return 0, f"No matching Sherpa found in avg_takt_per_sherpa list."
+            # No sherpa hint - return formatted summary of all sherpas
+            if entries:
+                # Format as a readable summary
+                formatted_lines = []
+                for entry in sorted(entries, key=lambda x: x.get("avg_takt_time_minutes", 0), reverse=True):
+                    sherpa = entry.get("sherpa", "Unknown")
+                    avg_takt = entry.get("avg_takt_time_minutes", 0)
+                    min_takt = entry.get("min_takt_time_minutes", 0)
+                    max_takt = entry.get("max_takt_time_minutes", 0)
+                    trips = entry.get("total_trips", 0)
+                    formatted_lines.append(
+                        f"{sherpa}: {avg_takt:.2f} min (min: {min_takt:.2f}, max: {max_takt:.2f}), {trips} trips"
+                    )
+                return "\n".join(formatted_lines), note
+            return "No takt time data available.", note
+        
+        # Fallback to direct key (if API structure changes)
+        return payload.get("takt_time") or payload.get("average_takt_time") or payload.get("avg_takt_time"), note
+
+    # Handle avg_obstacle_per_sherpa - from route_analytics
+    if item in ("avg_obstacle_per_sherpa", "avg_obstacle_time", "obstacle_time"):
+        entries = payload.get("avg_obstacle_per_sherpa") or []
+        if isinstance(entries, list):
+            # For avg_obstacle_per_sherpa item, always return all sherpas (ignore sherpa_hint)
+            if item == "avg_obstacle_per_sherpa":
+                if entries:
+                    formatted_lines = []
+                    for entry in sorted(entries, key=lambda x: x.get("avg_obstacle_time_min", 0), reverse=True):
+                        sherpa = entry.get("sherpa_name", "Unknown")
+                        obstacle_time = entry.get("avg_obstacle_time_min", 0)
+                        formatted_lines.append(f"{sherpa}: {obstacle_time:.2f} min")
+                    return "\n".join(formatted_lines), note
+                return "No obstacle time data available.", note
+            # For other obstacle_time queries, allow sherpa filtering
+            elif sherpa_hint:
+                # Find matching sherpa (note: API uses "sherpa_name" here)
+                e = _find_sherpa_entry(entries, sherpa_hint, name_key="sherpa_name")
+                if e:
+                    sherpa_name = e.get("sherpa_name", "")
+                    if str(sherpa_name).lower() != sherpa_hint.lower():
+                        note = f"Matched '{sherpa_hint}' to '{sherpa_name}'."
+                    return e.get("avg_obstacle_time_min"), note
+                return 0, f"No matching Sherpa found in avg_obstacle_per_sherpa list."
+            # No sherpa hint - return formatted summary
+            if entries:
+                formatted_lines = []
+                for entry in sorted(entries, key=lambda x: x.get("avg_obstacle_time_min", 0), reverse=True):
+                    sherpa = entry.get("sherpa_name", "Unknown")
+                    obstacle_time = entry.get("avg_obstacle_time_min", 0)
+                    formatted_lines.append(f"{sherpa}: {obstacle_time:.2f} min")
+                return "\n".join(formatted_lines), note
+            return "No obstacle time data available.", note
+        return payload.get("avg_obstacle_time") or payload.get("obstacle_time"), note
+
+    # Handle top_10_routes_takt - from route_analytics
+    if item in ("top_10_routes_takt", "top_routes_takt"):
+        entries = payload.get("top_10_routes_takt") or []
+        if isinstance(entries, list) and entries:
+            formatted_lines = []
+            for entry in entries[:10]:  # Already top 10, but limit to be safe
+                route = entry.get("route", [])
+                avg_takt = entry.get("avg_takt_time_minutes", 0)
+                route_str = " → ".join(route) if isinstance(route, list) else str(route)
+                formatted_lines.append(f"{route_str}: {avg_takt:.2f} min")
+            return "\n".join(formatted_lines), note
+        return "No route takt time data available.", note
+
+    # Handle route_utilization - from route_analytics
+    if item in ("route_utilization",):
+        entries = payload.get("route_utilization") or []
+        if isinstance(entries, list) and entries:
+            formatted_lines = []
+            for entry in sorted(entries, key=lambda x: x.get("utilization", 0), reverse=True):
+                route = entry.get("route", [])
+                utilization = entry.get("utilization", 0)
+                route_str = " → ".join(route) if isinstance(route, list) else str(route)
+                formatted_lines.append(f"{route_str}: {utilization:.2f}%")
+            return "\n".join(formatted_lines), note
+        return "No route utilization data available.", note
+
+    # Handle avg_obstacle_per_route - from route_analytics
+    if item in ("avg_obstacle_per_route",):
+        entries = payload.get("avg_obstacle_per_route") or []
+        if isinstance(entries, list) and entries:
+            formatted_lines = []
+            for entry in sorted(entries, key=lambda x: x.get("avg_obstacle_time_min", 0), reverse=True):
+                route = entry.get("route", [])
+                obstacle_time = entry.get("avg_obstacle_time_min", 0)
+                route_str = " → ".join(route) if isinstance(route, list) else str(route)
+                formatted_lines.append(f"{route_str}: {obstacle_time:.2f} min")
+            return "\n".join(formatted_lines), note
+        return "No obstacle time per route data available.", note
+
+    # default fallback
+    return payload.get(item), note

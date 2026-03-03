@@ -1,0 +1,1 @@
+# Sanjaya MCP server package
