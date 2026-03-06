@@ -1,0 +1,12 @@
+FROM apache/airflow:2.9.0-python3.11
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+
+# Install only the extra packages the DAG needs (avoids conflicts with Airflow's own deps)
+COPY requirements-dag.txt /tmp/requirements-dag.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-dag.txt

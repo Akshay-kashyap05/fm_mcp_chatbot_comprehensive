@@ -1,0 +1,98 @@
+services:
+
+  # ── Ollama: local LLM for NLU ────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── MCP chat client (interactive terminal) ───────────────────────────────
+  # Start with: docker compose run --rm mcp-chat
+  mcp-chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    stdin_open: true
+    tty: true
+    env_file: .env
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434   # use Docker service name, not localhost
+    volumes:
+      - .:/app                               # live reload: code changes apply immediately
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Airflow shared config (YAML anchor) ──────────────────────────────────
+  x-airflow-common: &airflow-common
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////opt/airflow/airflow.db"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "sanjaya-secret-change-in-prod"
+      AIRFLOW_HOME: /opt/airflow
+      PYTHONPATH: /app                       # DAG can import from src/
+    env_file: .env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags     # DAG files
+      - .:/app                               # src/, client_report_config.json, .env
+      - airflow_home:/opt/airflow            # Airflow DB, logs, plugins
+
+  # ── Airflow one-time init (DB migrate + admin user) ───────────────────────
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create
+          --username admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@example.com
+          --password admin
+          || true
+      "
+    restart: "no"
+
+  # ── Airflow scheduler (runs DAGs) ─────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow webserver (UI at :8080) ──────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  ollama_data:
+  airflow_home:

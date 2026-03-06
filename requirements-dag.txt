@@ -1,0 +1,9 @@
+# Extra packages needed by sanjaya_daily_report.py DAG and src/ imports.
+# Installed on top of apache/airflow base image.
+httpx>=0.27.0
+dateparser>=1.2.0
+reportlab>=4.0.0
+pytz>=2023.3
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+python-dateutil>=2.9.0

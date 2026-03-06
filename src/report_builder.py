@@ -15,6 +15,8 @@ from reportlab.platypus import (
     HRFlowable, Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
 )
 
+from src.email_client import send_email as _send_email
+
 DEFAULT_TZ = os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata")
 REPORT_RECIPIENT = os.environ.get("REPORT_RECIPIENT", "akshay.kashyap@atimotors.com")
 
@@ -636,12 +638,6 @@ def send_report_email(
     report_dir: str | None = None,
     recipients: Optional[List[str]] = None,
 ) -> None:
-    """Load .ses_client and send PDF to recipients (or REPORT_RECIPIENT env default)."""
-    if not report_dir:
-        report_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("ses_email", os.path.join(report_dir, ".ses_client.py"))
-    ses  = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ses)
-    to   = recipients if recipients else [REPORT_RECIPIENT]
-    ses.send_email(pdf_path, to, [], subject)
+    """Send PDF report to recipients via SMTP (or REPORT_RECIPIENT env default)."""
+    to = recipients if recipients else [REPORT_RECIPIENT]
+    _send_email(pdf_path, to, [], subject)
