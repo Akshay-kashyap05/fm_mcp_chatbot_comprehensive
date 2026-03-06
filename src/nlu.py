@@ -196,6 +196,40 @@ def _heuristic_parse(text: str) -> ParsedQuery:
             pq.time_phrase = key
             break
 
+    # Explicit date range: "X to Y" (e.g. "1 Jan 2026 to 5 Jan 2026")
+    if not pq.time_phrase:
+        # Match patterns like: "1 jan 2026 to 5 jan 2026" | "2026-01-01 to 2026-01-05"
+        # | "jan 1 2026 to jan 5 2026" | "1st jan to 5th jan 2026"
+        date_range_m = re.search(
+            r"("
+            r"\d{4}-\d{2}-\d{2}"           # ISO date: 2026-01-01
+            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{4}"  # "1 Jan 2026" / "Jan 2026"
+            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{2}"  # short year "1 Jan 26"
+            r")"
+            r"\s+to\s+"
+            r"("
+            r"\d{4}-\d{2}-\d{2}"
+            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{4}"
+            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{2}"
+            r")",
+            original_text, re.IGNORECASE,
+        )
+        if date_range_m:
+            pq.time_phrase = date_range_m.group(0).strip()
+
+    # Single explicit date: "1 Jan 2026" / "2026-01-01" / "1st Jan 2026"
+    if not pq.time_phrase:
+        single_m = re.search(
+            r"\b("
+            r"\d{4}-\d{2}-\d{2}"
+            r"|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4}"
+            r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}"
+            r")\b",
+            original_text, re.IGNORECASE,
+        )
+        if single_m:
+            pq.time_phrase = single_m.group(0).strip()
+
     return pq
 
 
