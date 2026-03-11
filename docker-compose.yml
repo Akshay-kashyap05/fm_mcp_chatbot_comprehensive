@@ -9,7 +9,7 @@ services:
       - ollama_data:/root/.ollama
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434'"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -23,8 +23,6 @@ services:
     stdin_open: true
     tty: true
     env_file: .env
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434   # use Docker service name, not localhost
     volumes:
       - .:/app                               # live reload: code changes apply immediately
     depends_on:
@@ -38,13 +36,14 @@ services:
       context: .
       dockerfile: Dockerfile.airflow
     environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////opt/airflow/airflow.db"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__WEBSERVER__SECRET_KEY: "sanjaya-secret-change-in-prod"
       AIRFLOW_HOME: /opt/airflow
       PYTHONPATH: /app                       # DAG can import from src/
+      SANJAYA_PROJECT_ROOT: /app             # PDF/config saved here, not /opt/
     env_file: .env
     volumes:
       - ./airflow/dags:/opt/airflow/dags     # DAG files
@@ -54,18 +53,10 @@ services:
   # ── Airflow one-time init (DB migrate + admin user) ───────────────────────
   airflow-init:
     <<: *airflow-common
-    command: >
-      bash -c "
-        airflow db migrate &&
-        airflow users create
-          --username admin
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@example.com
-          --password admin
-          || true
-      "
+    command: >-
+      bash -c "airflow db migrate &&
+      airflow users create --username admin --firstname Admin --lastname User
+      --role Admin --email admin@example.com --password admin || true"
     restart: "no"
 
   # ── Airflow scheduler (runs DAGs) ─────────────────────────────────────────
