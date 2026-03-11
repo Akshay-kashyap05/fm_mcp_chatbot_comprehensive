@@ -296,10 +296,33 @@ Available Prompts:
                 "or specify in your query."
             )
 
+        api_sherpa_name = pq.sherpa_hint
+        if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
+            api_sherpa_name = None
+
+        # ── Multi-metric: call each endpoint and combine ──────────────────
+        if pq.intent == "multi_metric" and len(pq.items) > 1:
+            parts, time_strings = [], {}
+            for metric in pq.items:
+                metric_response, _, ts = await get_metric_data_fn(
+                    metric=metric,
+                    client_name=client_name,
+                    fleet_name=fleet_name,
+                    time_range=time_phrase,
+                    timezone=timezone,
+                    sherpa_name=api_sherpa_name,
+                )
+                parts.append(metric_response)
+                time_strings = ts
+            combined = "\n\n".join(parts)
+            _save_pending_report(
+                client_name, fleet_name, time_phrase, timezone,
+                time_strings, combined, clean_text, sections=None,
+            )
+            return combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
+
+        # ── Single metric ─────────────────────────────────────────────────
         if pq.intent == "basic_analytics_item" and pq.item:
-            api_sherpa_name = pq.sherpa_hint
-            if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
-                api_sherpa_name = None
             metric_response, data, time_strings = await get_metric_data_fn(
                 metric=pq.item,
                 client_name=client_name,
@@ -314,6 +337,8 @@ Available Prompts:
                 sections=_item_to_section_names(pq.item),
             )
             return metric_response + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
+
+        # ── Full analytics summary ────────────────────────────────────────
         else:
             summary_text, data, time_strings = await fetch_analytics_fn(
                 client_name, fleet_name, time_phrase, timezone

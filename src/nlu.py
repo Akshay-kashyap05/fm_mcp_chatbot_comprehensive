@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import httpx
@@ -14,8 +14,9 @@ logger = logging.getLogger("nlu")
 
 @dataclass
 class ParsedQuery:
-    intent: str  # 'basic_analytics' | 'basic_analytics_item' | 'login' | 'help' | 'chat'
-    item: Optional[str] = None
+    intent: str  # 'basic_analytics' | 'basic_analytics_item' | 'multi_metric' | 'help'
+    item: Optional[str] = None          # primary (first) metric, or None
+    items: list = field(default_factory=list)  # all metrics when user asks for 2+
     sherpa_hint: Optional[str] = None
     fm_client_name: Optional[str] = None
     fleet_name: Optional[str] = None
@@ -110,6 +111,8 @@ def _heuristic_parse(text: str) -> ParsedQuery:
     if pq:
         pq.fm_client_name = fm_client
         pq.fleet_name = fleet
+        if pq.item:
+            pq.items = [pq.item]
         # If item is "per_sherpa" metric, clear sherpa_hint (means all sherpas)
         if pq.item and ("per_sherpa" in pq.item or "per-sherpa" in pq.item):
             pq.sherpa_hint = None
@@ -120,15 +123,15 @@ def _heuristic_parse(text: str) -> ParsedQuery:
     if "takt" in t:
         for item in ["takt_time", "average_takt_time"]:
             if item in ALLOWED_ITEMS:
-                pq = ParsedQuery(intent="basic_analytics_item", item="takt_time")
+                pq = ParsedQuery(intent="basic_analytics_item", item="takt_time", items=["takt_time"])
                 pq.fm_client_name = fm_client
                 pq.fleet_name = fleet
                 return pq
-    
+
     for item in ALLOWED_ITEMS:
         if item.replace("_", " ") in t or item in t:
             # if query is clearly asking one metric, return item intent
-            pq = ParsedQuery(intent="basic_analytics_item", item=item)
+            pq = ParsedQuery(intent="basic_analytics_item", item=item, items=[item])
             pq.fm_client_name = fm_client
             pq.fleet_name = fleet
             # If item is "per_sherpa" metric, clear sherpa_hint (means all sherpas)
@@ -268,8 +271,14 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         return pq
 
     schema = {
-        "intent": "basic_analytics | basic_analytics_item | help",
-        "item": "one of allowed items or null",
+        "intent": "basic_analytics | basic_analytics_item | multi_metric | help",
+        "items": (
+            "List of metric names from ALLOWED_ITEMS. "
+            "IMPORTANT: if the user asks for multiple metrics (comma- or 'and'-separated), "
+            "include ALL of them here and set intent to 'multi_metric'. "
+            "For a single metric set intent to 'basic_analytics_item'. "
+            "Empty list for summary/help."
+        ),
         "sherpa_hint": "string like tug-104 or null",
         "fm_client_name": "string or null",
         "fleet_name": "string or null",
@@ -283,15 +292,35 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         f"{json.dumps(schema)}\n\n"
         "Allowed items: "
         f"{sorted(ALLOWED_ITEMS)}\n\n"
+        "Examples:\n"
+        '- "uptime and obstacle time" → {"intent":"multi_metric","items":["uptime","avg_obstacle_time"],...}\n'
+        '- "total trips, distance and takt time" → {"intent":"multi_metric","items":["total_trips","total_distance_km","takt_time"],...}\n'
+        '- "uptime" → {"intent":"basic_analytics_item","items":["uptime"],...}\n'
+        '- "basic analytics" → {"intent":"basic_analytics","items":[],...}\n\n'
         "User text: "
         f"{text}\n"
     )
 
     try:
         obj = await _ollama_json(prompt, model=model)
+
+        # Parse items array from Ollama response
+        raw_items = obj.get("items") or []
+        if isinstance(raw_items, str):
+            raw_items = [raw_items]
+        valid_items = [i for i in raw_items if isinstance(i, str) and i in ALLOWED_ITEMS]
+
+        if len(valid_items) > 1:
+            resolved_intent = "multi_metric"
+        elif len(valid_items) == 1:
+            resolved_intent = "basic_analytics_item"
+        else:
+            resolved_intent = str(obj.get("intent") or "basic_analytics")
+
         pq = ParsedQuery(
-            intent=str(obj.get("intent") or "basic_analytics"),
-            item=obj.get("item"),
+            intent=resolved_intent,
+            item=valid_items[0] if valid_items else obj.get("item"),
+            items=valid_items,
             sherpa_hint=obj.get("sherpa_hint"),
             fm_client_name=obj.get("fm_client_name"),
             fleet_name=obj.get("fleet_name"),
@@ -302,55 +331,56 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         logger.warning("Ollama parse failed, falling back to heuristics: %s", e)
         pq = _heuristic_parse(text)
 
-    # Post-process: Fix route analytics metrics if Ollama missed them
+    # Post-process: Fix route analytics metrics if Ollama missed them.
+    # Skip entirely when Ollama already detected multi_metric — trust it.
     text_lower = text.lower()
-    
-    # Check for obstacle time queries
-    if "obstacle" in text_lower and "time" in text_lower:
-        if pq.intent != "basic_analytics_item" or pq.item not in ("avg_obstacle_per_sherpa", "avg_obstacle_time", "avg_obstacle_per_route"):
-            logger.debug("Fixing Ollama parse: detected obstacle time query")
-            pq.intent = "basic_analytics_item"
-            if "route" in text_lower or "routes" in text_lower:
-                pq.item = "avg_obstacle_per_route"
-            elif "sherpa" in text_lower or "per sherpa" in text_lower:
-                pq.item = "avg_obstacle_per_sherpa"
-            else:
-                pq.item = "avg_obstacle_time"
-    
-    # Check for top routes takt time
-    elif "top" in text_lower and ("route" in text_lower or "routes" in text_lower) and "takt" in text_lower:
-        if pq.intent != "basic_analytics_item" or pq.item not in ("top_10_routes_takt", "top_routes_takt"):
-            logger.debug("Fixing Ollama parse: detected top routes takt time query")
-            pq.intent = "basic_analytics_item"
-            pq.item = "top_10_routes_takt"
-    
-    # Check for route utilization
-    elif "route" in text_lower and "utilization" in text_lower:
-        if pq.intent != "basic_analytics_item" or pq.item != "route_utilization":
-            logger.debug("Fixing Ollama parse: detected route utilization query")
-            pq.intent = "basic_analytics_item"
-            pq.item = "route_utilization"
-    
-    # Check for takt time queries
-    elif ("takt" in text_lower and "time" in text_lower) or "average takt" in text_lower:
-        if pq.intent != "basic_analytics_item" or pq.item not in ("takt_time", "average_takt_time"):
-            logger.debug("Fixing Ollama parse: detected takt time query")
-            pq.intent = "basic_analytics_item"
-            pq.item = "takt_time"
-    
-    # Check for total trips queries
-    elif "total trips" in text_lower or ("trips" in text_lower and "total" in text_lower):
-        if pq.intent != "basic_analytics_item" or pq.item != "total_trips":
-            logger.debug("Fixing Ollama parse: detected total trips query")
-            pq.intent = "basic_analytics_item"
-            pq.item = "total_trips"
-    
-    # Check for total distance queries
-    elif "total distance" in text_lower or ("distance" in text_lower and "total" in text_lower):
-        if pq.intent != "basic_analytics_item" or pq.item != "total_distance_km":
-            logger.debug("Fixing Ollama parse: detected total distance query")
-            pq.intent = "basic_analytics_item"
-            pq.item = "total_distance_km"
+
+    if pq.intent != "multi_metric":
+        if "obstacle" in text_lower and "time" in text_lower:
+            if pq.item not in ("avg_obstacle_per_sherpa", "avg_obstacle_time", "avg_obstacle_per_route"):
+                logger.debug("Fixing Ollama parse: detected obstacle time query")
+                pq.intent = "basic_analytics_item"
+                if "route" in text_lower or "routes" in text_lower:
+                    pq.item = "avg_obstacle_per_route"
+                elif "sherpa" in text_lower or "per sherpa" in text_lower:
+                    pq.item = "avg_obstacle_per_sherpa"
+                else:
+                    pq.item = "avg_obstacle_time"
+                pq.items = [pq.item]
+        elif "top" in text_lower and ("route" in text_lower or "routes" in text_lower) and "takt" in text_lower:
+            if pq.item not in ("top_10_routes_takt", "top_routes_takt"):
+                logger.debug("Fixing Ollama parse: detected top routes takt time query")
+                pq.intent = "basic_analytics_item"
+                pq.item = "top_10_routes_takt"
+                pq.items = [pq.item]
+        elif "route" in text_lower and "utilization" in text_lower:
+            if pq.item != "route_utilization":
+                logger.debug("Fixing Ollama parse: detected route utilization query")
+                pq.intent = "basic_analytics_item"
+                pq.item = "route_utilization"
+                pq.items = [pq.item]
+        elif ("takt" in text_lower and "time" in text_lower) or "average takt" in text_lower:
+            if pq.item not in ("takt_time", "average_takt_time"):
+                logger.debug("Fixing Ollama parse: detected takt time query")
+                pq.intent = "basic_analytics_item"
+                pq.item = "takt_time"
+                pq.items = [pq.item]
+        elif "total trips" in text_lower or ("trips" in text_lower and "total" in text_lower):
+            if pq.item != "total_trips":
+                logger.debug("Fixing Ollama parse: detected total trips query")
+                pq.intent = "basic_analytics_item"
+                pq.item = "total_trips"
+                pq.items = [pq.item]
+        elif "total distance" in text_lower or ("distance" in text_lower and "total" in text_lower):
+            if pq.item != "total_distance_km":
+                logger.debug("Fixing Ollama parse: detected total distance query")
+                pq.intent = "basic_analytics_item"
+                pq.item = "total_distance_km"
+                pq.items = [pq.item]
+
+        # Ensure items is always in sync with item for single-metric results
+        if pq.item and not pq.items:
+            pq.items = [pq.item]
 
     # Post-process: Fix swapped client/fleet names
     # Check if client and fleet names might be swapped by looking at the original text
@@ -452,7 +482,10 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         pq.item = None
         pq.intent = "basic_analytics"
 
-    if pq.intent not in {"basic_analytics", "basic_analytics_item", "help"}:
+    # Sanitize items list — remove anything not in ALLOWED_ITEMS
+    pq.items = [i for i in pq.items if i in ALLOWED_ITEMS]
+
+    if pq.intent not in {"basic_analytics", "basic_analytics_item", "multi_metric", "help"}:
         pq.intent = "basic_analytics"
 
     _apply_defaults(pq, defaults)
