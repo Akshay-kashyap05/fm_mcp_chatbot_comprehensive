@@ -7,7 +7,10 @@ dateparser>=1.2.0
 PyYAML>=6.0.1
 python-dotenv>=1.0.0
 
-# CEAT report (ceat-nagpur_test.py)
+# Streamlit web UI
+streamlit>=1.35.0
+
+# CEAT report
 psycopg2-binary>=2.9.0
 reportlab>=4.0.0
 pandas>=2.0.0
