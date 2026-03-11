@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 # Ensure project root is on path so "src" is found when run from any cwd or on server
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +22,6 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,10 +29,15 @@ load_dotenv()
 from src.logging_config import setup_logging
 from src.sanjaya_client import SanjayaAPI
 from src.cache import TTLCache
-from src.time_parse import parse_time_range
-from src.formatting import summarize_basic_analytics, extract_item_value
-from src.report_builder import build_pdf, build_pdf_from_text, send_report_email
+from src.report_builder import build_pdf
 from src.chat_handler import handle_chat
+from src.analytics import (
+    ROUTE_ANALYTICS_ITEMS as _ROUTE_ANALYTICS_ITEMS,
+    resolve_sherpa_names_for_fleet as _resolve_sherpa_names_raw,
+    fetch_analytics_data_and_summary as _fetch_analytics_raw,
+    get_metric_response_and_data as _get_metric_raw,
+    generate_and_send_text_report as _generate_and_send_text_raw,
+)
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("fm_mcp")
@@ -51,15 +55,7 @@ mcp = FastMCP(
 
 BASE_URL = "https://sanjaya.atimotors.com"
 
-# Constants
-ROUTE_ANALYTICS_ITEMS = (
-    "takt_time", "average_takt_time",
-    "avg_obstacle_per_sherpa", "avg_obstacle_time", "obstacle_time",
-    "top_10_routes_takt", "top_routes_takt",
-    "route_utilization",
-    "avg_obstacle_per_route",
-)
-
+ROUTE_ANALYTICS_ITEMS = _ROUTE_ANALYTICS_ITEMS
 PER_SHERPA_ITEMS = ("avg_obstacle_per_sherpa",)
 
 # Initialize caches
@@ -86,56 +82,19 @@ def _defaults() -> Dict[str, Any]:
 
 
 async def _resolve_sherpa_names_for_fleet(client_name: str, fleet_name: str) -> Optional[List[str]]:
-    """Resolve client+fleet to list of sherpa names (same as get_metric). Returns None if unresolved."""
-    all_clients = await client_cache.get_or_set("all_clients", client.get_clients)
-    client_id = None
-    for c in all_clients:
-        if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == client_name.lower():
-            client_id = c.get("fm_client_id")
-            break
-    if not client_id:
-        for c in all_clients:
-            if isinstance(c, dict):
-                c_name = (c.get("fm_client_name") or "").lower()
-                if client_name.lower() in c_name or c_name in client_name.lower():
-                    client_id = c.get("fm_client_id")
-                    break
-    if not client_id:
-        return None
-    cache_key = f"sherpas_client_{client_id}"
-    all_sherpas = await sherpa_cache.get_or_set(cache_key, client.get_sherpas_by_client_id, client_id)
-    matching = [
-        s for s in all_sherpas
-        if isinstance(s, dict) and (s.get("fleet_name") or "").lower() == fleet_name.lower()
-    ]
-    names = [s.get("sherpa_name") for s in matching if s.get("sherpa_name")]
-    return names if names else None
+    return await _resolve_sherpa_names_raw(
+        client_name, fleet_name,
+        api=client, client_cache=client_cache, sherpa_cache=sherpa_cache,
+    )
 
 
 async def _fetch_analytics_data_and_summary(
     client_name: str, fleet_name: str, time_range: str, timezone: str
 ) -> tuple[str, Dict[str, Any], Dict[str, str]]:
-    """Fetch basic_analytics and return (summary_text, data, time_strings). Uses same sherpa list as get_metric so report matches chat."""
-    await client.ensure_token()
-    tr = parse_time_range(time_range, timezone=timezone)
-    time_strings = tr.to_strings()
-    sherpa_names = await _resolve_sherpa_names_for_fleet(client_name, fleet_name)
-    api_sherpa = sherpa_names if sherpa_names else None
-    data = await client.basic_analytics(
-        fm_client_name=client_name,
-        start_time=time_strings["start_time"],
-        end_time=time_strings["end_time"],
-        timezone=timezone,
-        fleet_name=fleet_name,
-        status=["succeeded", "failed", "cancelled"],
-        sherpa_name=api_sherpa,
+    return await _fetch_analytics_raw(
+        client_name, fleet_name, time_range, timezone,
+        api=client, client_cache=client_cache, sherpa_cache=sherpa_cache,
     )
-    # Unwrap so summary and report see the same structure (API may return { "data": { ... } })
-    if isinstance(data.get("data"), dict):
-        data = data["data"]
-    summary = summarize_basic_analytics(data)
-    summary_text = f"Analytics Summary for {fleet_name} ({time_range}):\n\n{summary}"
-    return summary_text, data, time_strings
 
 
 def _generate_and_send_report(
@@ -146,9 +105,8 @@ def _generate_and_send_report(
     timezone: str,
     time_strings: Dict[str, str],
 ) -> None:
-    """Build PDF from analytics data and email to REPORT_RECIPIENT. Runs in same process (no separate script).
-    sections_to_include: if set, only these sections are included (prompt-specific report); if None, all sections with data.
-    """
+    """Build PDF from raw analytics data and email it."""
+    from src.report_builder import send_report_email
     try:
         safe_name = (client_name + "_" + fleet_name).replace(" ", "-")[:50]
         pdf_filename = f"Analytics-Report-{safe_name}-{datetime.now().strftime('%Y-%m-%d')}.pdf"
@@ -169,29 +127,10 @@ def _generate_and_send_text_report(
     timezone: str,
     time_strings: Dict[str, str],
 ) -> None:
-    """Build PDF directly from the terminal/chat text and email it.
-
-    This follows the \"single source of truth\" approach: whatever text we
-    return to the client for a prompt is exactly what goes into the PDF.
-    """
-    try:
-        safe_name = (client_name + "_" + fleet_name).replace(" ", "-")[:50]
-        pdf_filename = f"Analytics-Report-{safe_name}-{datetime.now().strftime('%Y-%m-%d')}.pdf"
-        pdf_path = os.path.join(PROJECT_ROOT, pdf_filename)
-        build_pdf_from_text(
-            report_text,
-            client_name,
-            fleet_name,
-            time_range,
-            time_strings,
-            pdf_path,
-            report_dir=PROJECT_ROOT,
-        )
-        subject = f"Analytics Report - {fleet_name} - {time_range}"
-        send_report_email(pdf_path, subject, report_dir=PROJECT_ROOT)
-        logger.info("Text-based report generated and sent: %s", pdf_filename)
-    except Exception as e:
-        logger.warning("Text-based report generation/send failed: %s", e)
+    return _generate_and_send_text_raw(
+        report_text, client_name, fleet_name, time_range, timezone, time_strings,
+        project_root=PROJECT_ROOT,
+    )
 
 
 # ============================================================================
@@ -434,63 +373,6 @@ async def get_analytics_summary(
         return f"Error: {str(e)}"
 
 
-# Maps metric name → (dict key that holds the numeric value, display unit suffix)
-_SHERPA_LIST_VALUE_KEY: Dict[str, tuple] = {
-    "uptime":                  ("uptime_percentage",    "%"),
-    "uptime_percentage":       ("uptime_percentage",    "%"),
-    "availability":            ("availability_percentage", "%"),
-    "availability_percentage": ("availability_percentage", "%"),
-    "utilization":             ("utilization",          "%"),
-    "battery":                 ("battery_level",        "%"),
-    "battery_level":           ("battery_level",        "%"),
-}
-
-_METRIC_DISPLAY_LABEL: Dict[str, str] = {
-    "uptime":                  "Uptime",
-    "uptime_percentage":       "Uptime",
-    "availability":            "Availability",
-    "availability_percentage": "Availability",
-    "utilization":             "Utilization",
-    "total_trips":             "Total Trips",
-    "total_distance_km":       "Total Distance (km)",
-    "battery":                 "Battery Level",
-    "battery_level":           "Battery Level",
-}
-
-
-def _format_metric_value(metric: str, val: Any, note: str) -> str:
-    """Format a metric value for the terminal / PDF.  Converts per-sherpa lists to a table."""
-    label = _METRIC_DISPLAY_LABEL.get(metric, metric.replace("_", " ").title())
-
-    if isinstance(val, list) and val and isinstance(val[0], dict):
-        key, unit = _SHERPA_LIST_VALUE_KEY.get(metric, (None, ""))
-        col_w = 44  # sherpa column width
-        lines = [
-            f"{label}:",
-            f"  {'Sherpa':<{col_w}} {'Value':>8}",
-            f"  {'-' * col_w} {'------':>8}",
-        ]
-        for entry in val:
-            sherpa = entry.get("sherpa_name") or entry.get("sherpa", "Unknown")
-            if key:
-                v = entry.get(key)
-            else:
-                v = next(
-                    (entry[k] for k in entry
-                     if k not in ("sherpa_name", "sherpa") and isinstance(entry[k], (int, float))),
-                    None,
-                )
-            v_str = f"{v}{unit}" if v is not None else "N/A"
-            lines.append(f"  {sherpa:<{col_w}} {v_str:>8}")
-        result = "\n".join(lines)
-    else:
-        result = f"{label}: {val}"
-
-    if note:
-        result += f"\nNote: {note}"
-    return result
-
-
 async def _get_metric_response_and_data(
     metric: str,
     client_name: str,
@@ -499,87 +381,11 @@ async def _get_metric_response_and_data(
     timezone: str,
     sherpa_name: Optional[str] = None,
 ) -> tuple[str, Dict[str, Any], Dict[str, str]]:
-    """Internal: same logic as get_metric but returns (response_text, data, time_strings) so report can use same data."""
-    await client.ensure_token()
-    tr = parse_time_range(time_range, timezone=timezone)
-    time_strings = tr.to_strings()
-    api_sherpa_name = sherpa_name
-    if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
-        api_sherpa_name = None
-
-    if api_sherpa_name is None:
-        try:
-            all_clients = await client_cache.get_or_set("all_clients", client.get_clients)
-            client_id = None
-            client_name_lower = client_name.lower()
-            for c in all_clients:
-                if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == client_name_lower:
-                    client_id = c.get("fm_client_id")
-                    break
-            if not client_id:
-                for c in all_clients:
-                    if isinstance(c, dict):
-                        c_name = (c.get("fm_client_name") or "").lower()
-                        if client_name_lower in c_name or c_name in client_name_lower:
-                            client_id = c.get("fm_client_id")
-                            break
-            if client_id:
-                cache_key = f"sherpas_client_{client_id}"
-                all_sherpas = await sherpa_cache.get_or_set(cache_key, client.get_sherpas_by_client_id, client_id)
-                matching_sherpas = [
-                    s for s in all_sherpas
-                    if isinstance(s, dict) and (s.get("fleet_name") or "").lower() == fleet_name.lower()
-                ]
-                if matching_sherpas:
-                    sherpa_names = [s.get("sherpa_name") for s in matching_sherpas if s.get("sherpa_name")]
-                    if sherpa_names:
-                        api_sherpa_name = sherpa_names
-                        logger.info(f"Querying all {len(sherpa_names)} sherpas for client {client_name}, fleet {fleet_name}")
-                    else:
-                        api_sherpa_name = ""
-                else:
-                    api_sherpa_name = ""
-            else:
-                api_sherpa_name = ""
-        except Exception as e:
-            logger.error(f"Error fetching sherpas for client {client_name}: {e}")
-            api_sherpa_name = ""
-
-    if metric in ROUTE_ANALYTICS_ITEMS:
-        data = await client.route_analytics(
-            fm_client_name=client_name,
-            start_time=time_strings["start_time"],
-            end_time=time_strings["end_time"],
-            timezone=timezone,
-            fleet_name=fleet_name,
-            status=["succeeded", "failed", "cancelled"],
-            sherpa_name=api_sherpa_name,
-        )
-    else:
-        data = await client.basic_analytics(
-            fm_client_name=client_name,
-            start_time=time_strings["start_time"],
-            end_time=time_strings["end_time"],
-            timezone=timezone,
-            fleet_name=fleet_name,
-            status=["succeeded", "failed", "cancelled"],
-            sherpa_name=api_sherpa_name,
-        )
-        # Log API response shape so we can see if report gets the same data as chat
-        st = data.get("sherpa_wise_trips") if isinstance(data, dict) else None
-        if isinstance(data, dict) and isinstance(data.get("data"), dict):
-            st = data["data"].get("sherpa_wise_trips")
-        logger.info(
-            "basic_analytics response: total_trips=%s, sherpa_wise_trips len=%s, sherpa_name param was list=%s",
-            data.get("total_trips") if isinstance(data, dict) else "?",
-            len(st) if isinstance(st, list) else 0,
-            isinstance(api_sherpa_name, list),
-        )
-
-    extraction_sherpa_hint = None if api_sherpa_name == "" else (api_sherpa_name if isinstance(api_sherpa_name, str) else None)
-    val, note = extract_item_value(data, item=metric, sherpa_hint=extraction_sherpa_hint)
-    result = _format_metric_value(metric, val, note)
-    return result, data, time_strings
+    return await _get_metric_raw(
+        metric, client_name, fleet_name, time_range, timezone,
+        api=client, client_cache=client_cache, sherpa_cache=sherpa_cache,
+        sherpa_name=sherpa_name,
+    )
 
 
 @mcp.tool()

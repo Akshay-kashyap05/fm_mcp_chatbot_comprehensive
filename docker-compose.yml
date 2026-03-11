@@ -30,6 +30,22 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # ── Streamlit web UI (http://<server-ip>:8501) ────────────────────────────
+  streamlit-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: streamlit run streamlit_app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    env_file: .env
+    volumes:
+      - .:/app                               # live reload: code changes apply immediately
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ── Airflow shared config (YAML anchor) ──────────────────────────────────
   x-airflow-common: &airflow-common
     build:
