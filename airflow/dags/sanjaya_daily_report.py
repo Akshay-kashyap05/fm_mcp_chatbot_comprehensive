@@ -247,7 +247,7 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
             )
         safe_name = (client_name + "_" + fleet_name).replace(" ", "-")[:50]
         pdf_filename = f"Analytics-Report-{safe_name}-{datetime.now().strftime('%Y-%m-%d')}.pdf"
-        pdf_path = os.path.join(project_root, pdf_filename)
+        pdf_path = os.path.join("/tmp", pdf_filename)   # /tmp is always writable in any container/env
         build_pdf(
             merged, client_name, fleet_name, time_phrase, time_strings,
             pdf_path, report_dir=project_root, sections_to_include=sections,
