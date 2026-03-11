@@ -170,10 +170,16 @@ async def handle_chat(
         }
         pq = await parse_query(clean_text, defaults=empty_defaults)
 
-        # Override intent if user asked for a specific metric but NLU returned full summary
         t_lower = clean_text.lower()
-        if pq.intent == "basic_analytics" and pq.item in (None, ""):
-            if "total trips" in t_lower and "summary" not in t_lower and "analytics summary" not in t_lower:
+
+        # If user explicitly said "basic analytics" or "analytics summary", always return full summary
+        # regardless of what Ollama returned (it often hallucinates a specific metric).
+        if "basic analytics" in t_lower or "analytics summary" in t_lower:
+            pq.intent = "basic_analytics"
+            pq.item = None
+        elif pq.intent == "basic_analytics" and pq.item in (None, ""):
+            # NLU returned full-summary intent — promote to item intent if text mentions one metric
+            if "total trips" in t_lower and "summary" not in t_lower:
                 pq.intent = "basic_analytics_item"
                 pq.item = "total_trips"
             elif ("total distance" in t_lower or ("distance" in t_lower and "total" in t_lower)) and "summary" not in t_lower:
@@ -209,7 +215,8 @@ Available Prompts:
 - metric_query: Template for metric queries
 """
 
-        # Apply defaults
+        # Apply defaults — track whether client came from NLU or fallback
+        client_from_nlu = bool(pq.fm_client_name)
         client_name = pq.fm_client_name or defaults.get("fm_client_name")
         fleet_name = pq.fleet_name
         if not fleet_name and not pq.fm_client_name:
@@ -222,10 +229,12 @@ Available Prompts:
             timezone = str(timezone)
 
         # ── Client/fleet swap correction ──────────────────────────────────
+        # Fires when: NLU left client empty and put the client name in fleet_name.
+        # Also fires when client came from defaults (not NLU) and fleet_name matches a real client.
         try:
             await api.ensure_token()
             all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
-            if not client_name and fleet_name:
+            if (not client_from_nlu) and fleet_name:
                 for c in all_clients:
                     if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == fleet_name.lower():
                         logger.info("Correcting NLU swap: treating fleet_name '%s' as client_name", fleet_name)

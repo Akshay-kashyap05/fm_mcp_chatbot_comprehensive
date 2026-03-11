@@ -638,6 +638,12 @@ def send_report_email(
     report_dir: str | None = None,
     recipients: Optional[List[str]] = None,
 ) -> None:
-    """Send PDF report to recipients via SMTP (or REPORT_RECIPIENT env default)."""
+    """Send PDF report to recipients via SMTP, then delete the temporary file."""
     to = recipients if recipients else [REPORT_RECIPIENT]
-    _send_email(pdf_path, to, [], subject)
+    try:
+        _send_email(pdf_path, to, [], subject)
+    finally:
+        try:
+            os.remove(pdf_path)
+        except Exception:
+            pass
