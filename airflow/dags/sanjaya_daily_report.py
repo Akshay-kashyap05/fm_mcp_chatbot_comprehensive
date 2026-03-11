@@ -46,10 +46,11 @@ RELATIVE_TIME_KEYWORDS = (
     "last 20 minutes",
 )
 
-# Project root: always inferred from DAG file path (parent of airflow/dags). We do not use
-# Variable.get("sanjaya_report_project_root") so DAG parse never fails with "Variable not found".
-_PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-_PROJECT_ROOT = os.path.normpath(os.path.abspath(_PROJECT_ROOT))
+# Project root: use SANJAYA_PROJECT_ROOT env var if set (Docker: /app),
+# otherwise fall back to two levels above the DAG file (native install).
+_PROJECT_ROOT = os.environ.get("SANJAYA_PROJECT_ROOT") or os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+)
 
 # Fallback when no prompts Variable: single report time range (e.g. "today", "yesterday")
 TIME_RANGE = "yesterday"
