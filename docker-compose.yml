@@ -30,6 +30,29 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # ── MCP HTTP server (SSE transport, port 8000) ───────────────────────────
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python mcp_server.py sse
+    ports:
+      - "8001:8000"
+    env_file: .env
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      - .:/app                               # live reload: code changes apply immediately
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
   # ── Streamlit web UI (http://<server-ip>:8501) ────────────────────────────
   streamlit-ui:
     build:
@@ -39,10 +62,12 @@ services:
     ports:
       - "8501:8501"
     env_file: .env
+    environment:
+      - MCP_SERVER_URL=http://mcp-server:8000/sse
     volumes:
       - .:/app                               # live reload: code changes apply immediately
     depends_on:
-      ollama:
+      mcp-server:
         condition: service_healthy
     restart: unless-stopped
 
