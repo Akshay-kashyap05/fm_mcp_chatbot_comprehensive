@@ -46,6 +46,316 @@ ALLOWED_ITEMS = {
 }
 
 
+# Synonym → canonical metric mapping.
+# Checked before keyword extraction so users can say "tug wise", "bot wise", etc.
+_METRIC_ALIASES: Dict[str, str] = {
+    # sherpa_wise_distance synonyms
+    "tug wise distance":      "sherpa_wise_distance",
+    "tug-wise distance":      "sherpa_wise_distance",
+    "bot wise distance":      "sherpa_wise_distance",
+    "bot-wise distance":      "sherpa_wise_distance",
+    "robot wise distance":    "sherpa_wise_distance",
+    "per tug distance":       "sherpa_wise_distance",
+    "distance per tug":       "sherpa_wise_distance",
+    "distance per sherpa":    "sherpa_wise_distance",
+    "sherpa wise distance":   "sherpa_wise_distance",
+    # sherpa_wise_trips synonyms
+    "tug wise trips":         "sherpa_wise_trips",
+    "tug-wise trips":         "sherpa_wise_trips",
+    "bot wise trips":         "sherpa_wise_trips",
+    "bot-wise trips":         "sherpa_wise_trips",
+    "robot wise trips":       "sherpa_wise_trips",
+    "per tug trips":          "sherpa_wise_trips",
+    "trips per tug":          "sherpa_wise_trips",
+    "trips per sherpa":       "sherpa_wise_trips",
+    "sherpa wise trips":      "sherpa_wise_trips",
+    # Bare "tug wise" / "bot wise" → trips (most common ask)
+    "tug wise":               "sherpa_wise_trips",
+    "bot wise":               "sherpa_wise_trips",
+    "per bot":                "sherpa_wise_trips",
+    "per tug":                "sherpa_wise_trips",
+    # Other handy aliases
+    "route takt":             "top_10_routes_takt",
+    "takt per route":         "top_10_routes_takt",
+    "average takt":           "average_takt_time",
+    "avg takt":               "average_takt_time",
+    "route usage":            "route_utilization",
+    "obstacle count":         "avg_obstacle_per_sherpa",
+    "obstacle per sherpa":    "avg_obstacle_per_sherpa",
+    "obstacle per route":     "avg_obstacle_per_route",
+}
+
+# Keywords that terminate a client/fleet name match
+_NAME_STOP = (
+    r"and\s+fleet|fleet\b|yesterday|today|this\s+week|last\s+week|this\s+month|"
+    r"last\s+month|this\s+quarter|last\s+quarter|last\s+\d+|uptime|utilization|"
+    r"utilisation|obstacle|takt|trips|distance|availability|status|route|sherpa|"
+    r"analytics|summary|show|give|tell|get|me\b|please|what|how|for\s+\d|,|\."
+)
+
+
+def _extract_names(original_text: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract (client_name, fleet_name) from text using deterministic patterns.
+
+    Tries multiple patterns in priority order; returns original-case strings.
+    Never calls the LLM — all extraction is regex-based.
+
+    Patterns tried for client (in order):
+    1. "client <name>" or "for client <name>"
+    2. "for <UPPER-HYPHEN-NAME>," or "for <UPPER-HYPHEN-NAME> <keyword>"
+    3. Start of text: "<UPPER-HYPHEN-NAME> <keyword>"
+    """
+    fm_client: Optional[str] = None
+    fleet: Optional[str] = None
+
+    # ── Pattern 1: explicit "client" keyword (name AFTER "client") ──────────
+    # Negative lookahead prevents capturing common verbs as names
+    # e.g. "client give me..." → lookahead blocks; "client CEAT-Nagpur..." → matches
+    _VERB_LA = r"(?!(?:give|tell|get|show|please|what|how|is|are|was|were|i\b|we\b|the\b)\b)"
+    pat_client = (
+        r"\b(?:for\s+)?client\s+"
+        + _VERB_LA +
+        r"([A-Za-z0-9][A-Za-z0-9\s_\-]*?)"
+        r"(?:\s+(?:" + _NAME_STOP + r")|$)"
+    )
+    m = re.search(pat_client, original_text, re.IGNORECASE)
+    if m:
+        fm_client = m.group(1).strip().rstrip(",.")
+
+    # ── Pattern 2: "for <UPPER-OR-HYPHEN>," or "for <NAME> <metric-word>" ───
+    if not fm_client:
+        # Matches: "for YOKOHAMA-DAHEJ," or "for CEAT-Nagpur uptime"
+        m2 = re.search(
+            r"\bfor\s+([A-Za-z][A-Za-z0-9\-]{2,}(?:\s+[A-Za-z][A-Za-z0-9\-]+)*?)"
+            r"(?:\s*[,.]|\s+(?:" + _NAME_STOP + r")|$)",
+            original_text, re.IGNORECASE,
+        )
+        if m2:
+            candidate = m2.group(1).strip().rstrip(",.")
+            # Accept if it contains a hyphen (typical client format) or is all-uppercase
+            if "-" in candidate or candidate == candidate.upper():
+                fm_client = candidate
+
+    # ── Pattern 3: name at start of prompt, before a metric keyword ──────────
+    if not fm_client:
+        m3 = re.match(
+            r"^([A-Za-z][A-Za-z0-9\-]{2,}(?:\s+[A-Za-z][A-Za-z0-9\-]+)*?)"
+            r"\s+(?:uptime|utilization|utilisation|obstacle|takt|trips|distance|"
+            r"availability|status|route|analytics|summary|show)",
+            original_text, re.IGNORECASE,
+        )
+        if m3:
+            candidate = m3.group(1).strip()
+            if "-" in candidate or candidate == candidate.upper():
+                fm_client = candidate
+
+    # ── Pattern 4: "<name> client" — the keyword comes AFTER the name ────────
+    # e.g. "tvs hasur client uptime" or "uptime for yokohama-dahej client"
+    # "client" right after the name is a strong signal → relax hyphen/uppercase guard.
+    if not fm_client:
+        m4 = re.search(
+            r"([A-Za-z][A-Za-z0-9\-]{2,}(?:\s+[A-Za-z][A-Za-z0-9\-]+)*?)\s+client\b",
+            original_text, re.IGNORECASE,
+        )
+        if m4:
+            candidate = m4.group(1).strip().rstrip(",.")
+            cwords = candidate.split()
+            # Accept multi-word names, hyphenated names, or names ≥ 4 chars
+            if len(cwords) >= 2 or "-" in candidate or len(candidate) >= 4:
+                fm_client = candidate
+
+    # ── Fleet: "fleet <name>" or "for fleet <name>" ──────────────────────────
+    pat_fleet = (
+        r"\b(?:for\s+)?fleet\s+"
+        r"([A-Za-z0-9][A-Za-z0-9\s_\-]*?)"
+        r"(?:\s+(?:and\b|for\b|today|yesterday|this|last|previous|summary|"
+        r"analytics|total|distance|trips|uptime|utilization|availability|"
+        r"status|battery|mode|activity|sherpa|tug)|$)"
+    )
+    m = re.search(pat_fleet, original_text, re.IGNORECASE)
+    if m:
+        fleet = m.group(1).strip().rstrip(",.")
+
+    return fm_client, fleet
+
+
+def _extract_metrics(t: str) -> list:
+    """Return all ALLOWED_ITEMS metrics mentioned in lowercased text t.
+
+    Checks _METRIC_ALIASES first (longer phrases win), then keyword checks.
+    "sherpa wise" / "by sherpa" / "per sherpa" anywhere in text upgrades
+    total_trips → sherpa_wise_trips and total_distance_km → sherpa_wise_distance.
+    Returns [] if nothing matches.
+    """
+    t_orig = t  # save before alias scan modifies it
+    found = []
+
+    # ── Alias scan first (sorted longest → shortest to avoid partial matches) ─
+    for phrase in sorted(_METRIC_ALIASES, key=len, reverse=True):
+        if phrase in t:
+            canonical = _METRIC_ALIASES[phrase]
+            if canonical not in found:
+                found.append(canonical)
+            # Remove the matched phrase from further matching to avoid double-hits
+            t = t.replace(phrase, " ", 1)
+
+    # High-specificity checks first
+    if "top" in t and ("route" in t or "routes" in t) and "takt" in t:
+        found.append("top_10_routes_takt")
+    if "route" in t and ("utilization" in t or "utilisation" in t):
+        found.append("route_utilization")
+    if "obstacle" in t and ("route" in t or "routes" in t):
+        found.append("avg_obstacle_per_route")
+    if "obstacle" in t and ("sherpa" in t or "per sherpa" in t or "per-sherpa" in t):
+        found.append("avg_obstacle_per_sherpa")
+    if ("obstacle" in t and "time" in t) and "avg_obstacle_per_sherpa" not in found and "avg_obstacle_per_route" not in found:
+        found.append("avg_obstacle_time")
+    if ("takt time" in t or ("takt" in t and "time" in t) or "average takt" in t) and "top_10_routes_takt" not in found:
+        found.append("takt_time")
+    if "total trips" in t or ("trips" in t and "total" in t):
+        found.append("total_trips")
+    elif "trips" in t:
+        found.append("total_trips")
+    if "total distance" in t or ("distance" in t and "total" in t):
+        found.append("total_distance_km")
+    elif "distance" in t:
+        found.append("total_distance_km")
+    if "uptime" in t:
+        found.append("uptime")
+    if "availability" in t:
+        found.append("availability")
+    if "utilization" in t or "utilisation" in t:
+        if "route_utilization" not in found:
+            found.append("utilization")
+    if "status" in t and ("tug" in t or "sherpa" in t):
+        found.append("sherpa_status")
+
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for m in found:
+        if m not in seen:
+            seen.add(m)
+            result.append(m)
+
+    # "sherpa wise" / "by sherpa" / "per sherpa" used as a global modifier:
+    # upgrades total_trips → sherpa_wise_trips, total_distance_km → sherpa_wise_distance
+    _SHERPA_MOD = ("sherpa wise", "sherpa-wise", "by sherpa", "per sherpa")
+    if any(mod in t_orig for mod in _SHERPA_MOD):
+        _UPGRADE = {
+            "total_trips":      "sherpa_wise_trips",
+            "total_distance_km": "sherpa_wise_distance",
+        }
+        result = [_UPGRADE.get(m, m) for m in result]
+        # Re-deduplicate in case both aliases resolved to the same canonical
+        seen2, result2 = set(), []
+        for m in result:
+            if m not in seen2:
+                seen2.add(m)
+                result2.append(m)
+        result = result2
+
+    return result
+
+
+def _extract_sherpa(t: str) -> Optional[str]:
+    """Extract tug-NNN style sherpa hint from lowercased text."""
+    if "per sherpa" in t or "per-sherpa" in t or "by sherpa" in t:
+        return None  # "all sherpas" mode — no specific hint
+    m = re.search(
+        r"\b(tug[- ]?\d+(?:[- ][a-z0-9\-]+)*?)"
+        r"(?:\s+(?:for|client|fleet|today|yesterday|this|last|previous|summary|"
+        r"analytics|total|distance|trips|uptime|utilization|availability|"
+        r"status|battery|mode|activity|sherpa|tug)\b|$)",
+        t, re.IGNORECASE,
+    )
+    return m.group(1).replace(" ", "-").lower() if m else None
+
+
+def _extract_time(t: str, original_text: str) -> Optional[str]:
+    """Extract time phrase from text; returns None if not found."""
+    # Normalize "a.m."/"a.m"/"p.m."/"p.m" → "am"/"pm" (trailing dot optional)
+    t            = re.sub(r'\ba\.m\.?', 'am', t,             flags=re.IGNORECASE)
+    t            = re.sub(r'\bp\.m\.?', 'pm', t,             flags=re.IGNORECASE)
+    original_text = re.sub(r'\ba\.m\.?', 'am', original_text, flags=re.IGNORECASE)
+    original_text = re.sub(r'\bp\.m\.?', 'pm', original_text, flags=re.IGNORECASE)
+
+    # ── Hour-qualified ranges FIRST (before keyword shortcuts) ───────────────
+    # Catches: "yesterday 7am to 7pm", "today 9:00 to 17:00", "7am to 7pm yesterday"
+    _TIME_TOKEN = r"\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2}"
+    _DAY_TOKEN  = r"yesterday|today|day before yesterday"
+    hour_range = re.search(
+        rf"\b({_DAY_TOKEN})\s+({_TIME_TOKEN})\s+to\s+({_TIME_TOKEN})\b",
+        t, re.IGNORECASE,
+    )
+    if hour_range:
+        return hour_range.group(0).strip()
+    # Also: "7am to 7pm yesterday/today"
+    hour_range2 = re.search(
+        rf"\b({_TIME_TOKEN})\s+to\s+({_TIME_TOKEN})\s+({_DAY_TOKEN})\b",
+        t, re.IGNORECASE,
+    )
+    if hour_range2:
+        return hour_range2.group(0).strip()
+
+    for key in [
+        "today", "yesterday", "day before yesterday",
+        "last hour", "last 24 hours",
+        "this week", "previous week", "last week",
+        "this month", "previous month", "last month",
+        "this quarter", "last quarter",
+    ]:
+        if key in t:
+            return key
+
+    # last N hours / days
+    m = re.search(r"\blast\s+(\d+)\s*(hours?|days?)\b", t)
+    if m:
+        return m.group(0)
+
+    # ── Date+time range: "7 march 8am to 12 march 8pm" (already normalized) ──
+    _DATE_PART = r"\d{1,2}(?:st|nd|rd|th)?\s+\w+"          # "7 march", "12th april"
+    _OPT_YEAR  = r"(?:\s+\d{4})?"                           # optional year
+    _TIME_PART = r"\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)"      # "8am", "8:30 pm"
+    datetime_range_m = re.search(
+        rf"({_DATE_PART}{_OPT_YEAR}{_TIME_PART})"
+        r"\s+to\s+"
+        rf"({_DATE_PART}{_OPT_YEAR}{_TIME_PART})",
+        original_text, re.IGNORECASE,
+    )
+    if datetime_range_m:
+        return datetime_range_m.group(0).strip()
+
+    # Explicit date range: "1 Jan 2026 to 5 Jan 2026"
+    date_range_m = re.search(
+        r"("
+        r"\d{4}-\d{2}-\d{2}"
+        r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{4}"
+        r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{2}"
+        r")"
+        r"\s+to\s+"
+        r"("
+        r"\d{4}-\d{2}-\d{2}"
+        r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{4}"
+        r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{2}"
+        r")",
+        original_text, re.IGNORECASE,
+    )
+    if date_range_m:
+        return date_range_m.group(0).strip()
+
+    # Single explicit date
+    single_m = re.search(
+        r"\b("
+        r"\d{4}-\d{2}-\d{2}"
+        r"|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4}"
+        r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}"
+        r")\b",
+        original_text, re.IGNORECASE,
+    )
+    return single_m.group(0).strip() if single_m else None
+
+
 def _heuristic_parse(text: str) -> ParsedQuery:
     original_text = text.strip()
     t = original_text.lower()
@@ -53,187 +363,57 @@ def _heuristic_parse(text: str) -> ParsedQuery:
     if t in {"help", "?", "what can i ask", "what else can i ask"}:
         return ParsedQuery(intent="help")
 
-    # Extract client name - look for "for client X" or "client X"
-    # Stop before " and fleet" or " fleet" so we don't capture "and" as part of client name
-    fm_client = None
-    m = re.search(r"\b(?:for\s+)?client\s+([A-Za-z0-9\s_-]+?)(?:\s+and\s+fleet\b|\s+fleet\b|$)", t, re.IGNORECASE)
-    if m:
-        m_orig = re.search(r"\b(?:for\s+)?client\s+([A-Za-z0-9\s_-]+?)(?:\s+and\s+fleet\b|\s+fleet\b|$)", original_text, re.IGNORECASE)
-        if m_orig:
-            fm_client = m_orig.group(1).strip()
-    
-    # Extract fleet name - look for "for fleet X" or "fleet X"
-    # Use original text to preserve case
-    fleet = None
-    # Fleet names can have spaces, underscores, hyphens, and special chars, so match after "fleet" until end or next keyword
-    m = re.search(r"\b(?:for\s+)?fleet\s+([A-Za-z0-9\s_-]+?)(?:\s+(?:and|for|today|yesterday|this|last|previous|summary|analytics|total|distance|trips|uptime|utilization|availability|status|battery|mode|activity|sherpa|tug)\b|$)", t, re.IGNORECASE)
-    if m:
-        # Extract from original text to preserve case
-        m_orig = re.search(r"\b(?:for\s+)?fleet\s+([A-Za-z0-9\s_-]+?)(?:\s+(?:and|for|today|yesterday|this|last|previous|summary|analytics|total|distance|trips|uptime|utilization|availability|status|battery|mode|activity|sherpa|tug)\b|$)", original_text, re.IGNORECASE)
-        if m_orig:
-            fleet = m_orig.group(1).strip()
-    
-    # common phrasings (check these first for better matching)
-    pq = None
-    # Check for takt time variations FIRST (must be before other checks to avoid falling through to summary)
-    # Match: "takt time", "average takt time", "takt", "average takt", etc.
-    if "takt time" in t or ("takt" in t and "time" in t) or "average takt" in t or ("takt" in t and "average" in t):
-        # Check if it's "top routes takt" or "top 10 routes takt"
-        if "top" in t and ("route" in t or "routes" in t):
-            pq = ParsedQuery(intent="basic_analytics_item", item="top_10_routes_takt")
-        else:
-            pq = ParsedQuery(intent="basic_analytics_item", item="takt_time")
-    elif "obstacle time" in t or ("obstacle" in t and "time" in t):
-        # Check if it's per route or per sherpa
-        if "route" in t or "routes" in t:
-            pq = ParsedQuery(intent="basic_analytics_item", item="avg_obstacle_per_route")
-        elif "sherpa" in t or "per sherpa" in t or "per-sherpa" in t:
-            pq = ParsedQuery(intent="basic_analytics_item", item="avg_obstacle_per_sherpa")
-            # "per sherpa" means all sherpas, so clear any sherpa hint
-            pq.sherpa_hint = None
-        else:
-            pq = ParsedQuery(intent="basic_analytics_item", item="avg_obstacle_time")
-    elif "route utilization" in t or ("route" in t and "utilization" in t):
-        pq = ParsedQuery(intent="basic_analytics_item", item="route_utilization")
-    elif "total trips" in t:
-        pq = ParsedQuery(intent="basic_analytics_item", item="total_trips")
-    elif "total distance" in t or "distance" in t:
-        pq = ParsedQuery(intent="basic_analytics_item", item="total_distance_km")
-    elif "uptime" in t:
-        pq = ParsedQuery(intent="basic_analytics_item", item="uptime")
-    elif "availability" in t:
-        pq = ParsedQuery(intent="basic_analytics_item", item="availability")
-    elif "utilization" in t or "utilisation" in t:
-        pq = ParsedQuery(intent="basic_analytics_item", item="utilization")
-    elif "status" in t and ("tug" in t or "sherpa" in t):
-        pq = ParsedQuery(intent="basic_analytics_item", item="sherpa_status")
-    
-    if pq:
-        pq.fm_client_name = fm_client
-        pq.fleet_name = fleet
-        if pq.item:
-            pq.items = [pq.item]
-        # If item is "per_sherpa" metric, clear sherpa_hint (means all sherpas)
-        if pq.item and ("per_sherpa" in pq.item or "per-sherpa" in pq.item):
+    fm_client, fleet = _extract_names(original_text)
+    sherpa = _extract_sherpa(t)
+    time_phrase = _extract_time(t, original_text)
+    metrics = _extract_metrics(t)
+
+    # ── Multi-metric ─────────────────────────────────────────────────────────
+    if len(metrics) > 1:
+        pq = ParsedQuery(
+            intent="multi_metric",
+            item=metrics[0],
+            items=metrics,
+            fm_client_name=fm_client,
+            fleet_name=fleet,
+            sherpa_hint=sherpa,
+            time_phrase=time_phrase,
+        )
+        return pq
+
+    # ── Single metric ─────────────────────────────────────────────────────────
+    if len(metrics) == 1:
+        pq = ParsedQuery(
+            intent="basic_analytics_item",
+            item=metrics[0],
+            items=metrics,
+            fm_client_name=fm_client,
+            fleet_name=fleet,
+            sherpa_hint=sherpa,
+            time_phrase=time_phrase,
+        )
+        if "per_sherpa" in metrics[0] or "per-sherpa" in metrics[0]:
             pq.sherpa_hint = None
         return pq
-    
-    # items - check ALLOWED_ITEMS for other matches
-    # Prioritize takt_time if "takt" is mentioned
-    if "takt" in t:
-        for item in ["takt_time", "average_takt_time"]:
-            if item in ALLOWED_ITEMS:
-                pq = ParsedQuery(intent="basic_analytics_item", item="takt_time", items=["takt_time"])
-                pq.fm_client_name = fm_client
-                pq.fleet_name = fleet
-                return pq
 
-    for item in ALLOWED_ITEMS:
-        if item.replace("_", " ") in t or item in t:
-            # if query is clearly asking one metric, return item intent
-            pq = ParsedQuery(intent="basic_analytics_item", item=item, items=[item])
-            pq.fm_client_name = fm_client
-            pq.fleet_name = fleet
-            # If item is "per_sherpa" metric, clear sherpa_hint (means all sherpas)
-            if "per_sherpa" in item or "per-sherpa" in item:
-                pq.sherpa_hint = None
-            return pq
-
-    # general summary - only if no specific metric was found
-    # Be careful: "analytics" should not match "average" (they're different words)
+    # ── Analytics summary ─────────────────────────────────────────────────────
     if "summary" in t or ("analytics" in t and "takt" not in t):
-        pq = ParsedQuery(intent="basic_analytics")
-        pq.fm_client_name = fm_client
-        pq.fleet_name = fleet
-        return pq
-
-    # If we haven't extracted client/fleet yet, try again (for general analytics queries)
-    if not fm_client:
-        m = re.search(r"\b(?:for\s+)?client\s+([A-Za-z0-9\s-]+?)(?:\s+fleet\b|$)", t, re.IGNORECASE)
-        if m:
-            m_orig = re.search(r"\b(?:for\s+)?client\s+([A-Za-z0-9\s-]+?)(?:\s+fleet\b|$)", original_text, re.IGNORECASE)
-            if m_orig:
-                fm_client = m_orig.group(1).strip()
-    
-    if not fleet:
-        m = re.search(r"\b(?:for\s+)?fleet\s+([A-Za-z0-9\s-]+?)(?:\s+(?:and|for|today|yesterday|this|last|previous|summary|analytics|total|distance|trips|uptime|utilization|availability|status|battery|mode|activity|sherpa|tug)\b|$)", t, re.IGNORECASE)
-        if m:
-            m_orig = re.search(r"\b(?:for\s+)?fleet\s+([A-Za-z0-9\s-]+?)(?:\s+(?:and|for|today|yesterday|this|last|previous|summary|analytics|total|distance|trips|uptime|utilization|availability|status|battery|mode|activity|sherpa|tug)\b|$)", original_text, re.IGNORECASE)
-            if m_orig:
-                fleet = m_orig.group(1).strip()
-    
-    # sherpa hint, e.g., 'tug-104' or 'tug-107-ceat-nagpur-12'
-    # Only extract if query doesn't say "per sherpa" (which means all sherpas)
-    sherpa = None
-    if "per sherpa" not in t and "per-sherpa" not in t:
-        # Try full pattern first (tug-XXX-...), then short pattern (tug-XXX)
-        # Stop at word boundaries or keywords like "for", "client", "fleet", etc.
-        # Pattern: tug followed by optional dash/space, then digits, then optional dashes and alphanumeric parts
-        # But stop before keywords like "for", "client", "fleet"
-        m = re.search(r"\b(tug[- ]?\d+(?:[- ][a-z0-9-]+)*?)(?:\s+(?:for|client|fleet|today|yesterday|this|last|previous|summary|analytics|total|distance|trips|uptime|utilization|availability|status|battery|mode|activity|sherpa|tug)\b|$)", t, re.IGNORECASE)
-        if m:
-            sherpa = m.group(1).replace(" ", "-").lower()
-
-    pq = ParsedQuery(intent="basic_analytics")
-    pq.fm_client_name = fm_client
-    pq.fleet_name = fleet
-    pq.sherpa_hint = sherpa
-
-    # time phrase hints
-    for key in [
-        "today",
-        "yesterday",
-        "day before yesterday",
-        "last hour",
-        "last 24 hours",
-        "this week",
-        "previous week",
-        "last week",
-        "this month",
-        "previous month",
-        "last month",
-        "this quarter",
-        "last quarter",
-    ]:
-        if key in t:
-            pq.time_phrase = key
-            break
-
-    # Explicit date range: "X to Y" (e.g. "1 Jan 2026 to 5 Jan 2026")
-    if not pq.time_phrase:
-        # Match patterns like: "1 jan 2026 to 5 jan 2026" | "2026-01-01 to 2026-01-05"
-        # | "jan 1 2026 to jan 5 2026" | "1st jan to 5th jan 2026"
-        date_range_m = re.search(
-            r"("
-            r"\d{4}-\d{2}-\d{2}"           # ISO date: 2026-01-01
-            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{4}"  # "1 Jan 2026" / "Jan 2026"
-            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{2}"  # short year "1 Jan 26"
-            r")"
-            r"\s+to\s+"
-            r"("
-            r"\d{4}-\d{2}-\d{2}"
-            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{4}"
-            r"|(?:\d{1,2}(?:st|nd|rd|th)?\s+)?\w+\s+\d{2}"
-            r")",
-            original_text, re.IGNORECASE,
+        return ParsedQuery(
+            intent="basic_analytics",
+            fm_client_name=fm_client,
+            fleet_name=fleet,
+            sherpa_hint=sherpa,
+            time_phrase=time_phrase,
         )
-        if date_range_m:
-            pq.time_phrase = date_range_m.group(0).strip()
 
-    # Single explicit date: "1 Jan 2026" / "2026-01-01" / "1st Jan 2026"
-    if not pq.time_phrase:
-        single_m = re.search(
-            r"\b("
-            r"\d{4}-\d{2}-\d{2}"
-            r"|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4}"
-            r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}"
-            r")\b",
-            original_text, re.IGNORECASE,
-        )
-        if single_m:
-            pq.time_phrase = single_m.group(0).strip()
-
-    return pq
+    # ── Fallback: general summary ─────────────────────────────────────────────
+    return ParsedQuery(
+        intent="basic_analytics",
+        fm_client_name=fm_client,
+        fleet_name=fleet,
+        sherpa_hint=sherpa,
+        time_phrase=time_phrase,
+    )
 
 
 async def _ollama_json(prompt: str, model: str) -> Dict[str, Any]:
@@ -280,8 +460,6 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
             "Empty list for summary/help."
         ),
         "sherpa_hint": "string like tug-104 or null",
-        "fm_client_name": "string or null",
-        "fleet_name": "string or null",
         "timezone": "IANA timezone or null",
         "time_phrase": "string or null",
     }
@@ -296,10 +474,15 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         '- "uptime and obstacle time" → {"intent":"multi_metric","items":["uptime","avg_obstacle_time"],...}\n'
         '- "total trips, distance and takt time" → {"intent":"multi_metric","items":["total_trips","total_distance_km","takt_time"],...}\n'
         '- "uptime" → {"intent":"basic_analytics_item","items":["uptime"],...}\n'
-        '- "basic analytics" → {"intent":"basic_analytics","items":[],...}\n\n'
+        '- "basic analytics" → {"intent":"basic_analytics","items":[],...}\n'
+        '- "tug wise distance" or "bot wise distance" → {"intent":"basic_analytics_item","items":["sherpa_wise_distance"],...}\n'
+        '- "tug wise trips" or "bot wise" or "per tug" → {"intent":"basic_analytics_item","items":["sherpa_wise_trips"],...}\n\n'
         "User text: "
         f"{text}\n"
     )
+
+    # Always extract names deterministically — never trust the LLM for these
+    hq = _heuristic_parse(text)
 
     try:
         obj = await _ollama_json(prompt, model=model)
@@ -317,19 +500,34 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         else:
             resolved_intent = str(obj.get("intent") or "basic_analytics")
 
+        # Prefer heuristic items when they contain sherpa-wise metrics
+        # (Ollama doesn't know the "sherpa wise" → sherpa_wise_* upgrade)
+        if hq.items and any("sherpa_wise" in i for i in hq.items):
+            use_items = hq.items
+        else:
+            use_items = valid_items
+
+        if len(use_items) > 1:
+            resolved_intent = "multi_metric"
+        elif len(use_items) == 1:
+            resolved_intent = "basic_analytics_item"
+
         pq = ParsedQuery(
             intent=resolved_intent,
-            item=valid_items[0] if valid_items else obj.get("item"),
-            items=valid_items,
-            sherpa_hint=obj.get("sherpa_hint"),
-            fm_client_name=obj.get("fm_client_name"),
-            fleet_name=obj.get("fleet_name"),
-            timezone=obj.get("timezone"),
-            time_phrase=obj.get("time_phrase"),
+            item=use_items[0] if use_items else obj.get("item"),
+            items=use_items,
+            # Names always come from heuristic parser, never the LLM
+            fm_client_name=hq.fm_client_name,
+            fleet_name=hq.fleet_name,
+            # Prefer heuristic sherpa (more precise tug-NNN check), fall back to Ollama
+            sherpa_hint=hq.sherpa_hint or obj.get("sherpa_hint"),
+            timezone=obj.get("timezone") or hq.timezone,
+            # Prefer heuristic time (handles hour-ranges Ollama can't), fall back to Ollama
+            time_phrase=hq.time_phrase or obj.get("time_phrase"),
         )
     except Exception as e:
         logger.warning("Ollama parse failed, falling back to heuristics: %s", e)
-        pq = _heuristic_parse(text)
+        pq = hq
 
     # Post-process: Fix route analytics metrics if Ollama missed them.
     # Skip entirely when Ollama already detected multi_metric — trust it.
@@ -382,52 +580,6 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         if pq.item and not pq.items:
             pq.items = [pq.item]
 
-    # Post-process: Fix swapped client/fleet names
-    # Check if client and fleet names might be swapped by looking at the original text
-    if pq.fm_client_name and pq.fleet_name:
-        text_lower = text.lower()
-        # Find positions of "client" and "fleet" keywords
-        client_pos = text_lower.find("client")
-        fleet_pos = text_lower.find("fleet")
-        
-        if client_pos != -1 and fleet_pos != -1 and client_pos < fleet_pos:
-            # "client" comes before "fleet" in the query
-            # Extract what comes after "client" and before "fleet" (this should be the client name)
-            # Extract what comes after "fleet" (this should be the fleet name)
-            client_section = text[client_pos:fleet_pos].lower()
-            fleet_section = text[fleet_pos:].lower()
-            
-            client_name_lower = pq.fm_client_name.lower()
-            fleet_name_lower = pq.fleet_name.lower()
-            
-            # Check if the parsed client_name actually appears in the client section
-            # and if the parsed fleet_name actually appears in the fleet section
-            client_name_in_client_section = client_name_lower in client_section
-            fleet_name_in_fleet_section = fleet_name_lower in fleet_section
-            
-            # Also check the reverse - if they're swapped, the client_name would be in fleet section
-            client_name_in_fleet_section = client_name_lower in fleet_section
-            fleet_name_in_client_section = fleet_name_lower in client_section
-            
-            # If client_name contains underscores (like "owens_corning5"), it's likely a fleet name
-            # If fleet_name contains spaces (like "Owens Corning-Taloja"), it's likely a client name
-            # OR if the names appear in the wrong sections, swap them
-            should_swap = False
-            if "_" in pq.fm_client_name and " " in pq.fleet_name:
-                # Heuristic: client names typically have spaces, fleet names typically have underscores
-                should_swap = True
-                logger.debug(f"Fixing swapped client/fleet names (heuristic): client={pq.fm_client_name}, fleet={pq.fleet_name}")
-            elif (client_name_in_fleet_section and fleet_name_in_client_section) and \
-                 not (client_name_in_client_section and fleet_name_in_fleet_section):
-                # The names appear in the wrong sections - definitely swapped
-                should_swap = True
-                logger.debug(f"Fixing swapped client/fleet names (position check): client={pq.fm_client_name}, fleet={pq.fleet_name}")
-            
-            if should_swap:
-                # Swap them
-                pq.fm_client_name, pq.fleet_name = pq.fleet_name, pq.fm_client_name
-                logger.debug(f"After swap: client={pq.fm_client_name}, fleet={pq.fleet_name}")
-
     # Post-process: Validate sherpa_hint - clear it if it doesn't appear in the original query
     # This prevents Ollama from hallucinating sherpa names that weren't mentioned
     if pq.sherpa_hint:
@@ -439,7 +591,6 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         if sherpa_hint_lower not in text_lower:
             # Check if a significant portion appears (e.g., "tug-104" pattern)
             # Extract numeric part (e.g., "104" from "tug-104")
-            import re
             numeric_match = re.search(r'\d+', sherpa_hint_lower)
             if numeric_match:
                 numeric_part = numeric_match.group(0)
@@ -474,8 +625,9 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
                 # Valid sherpa pattern found in query
                 logger.debug(f"Valid sherpa_hint '{pq.sherpa_hint}' found in query")
             else:
-                # Sherpa hint appears in query but not as a valid sherpa pattern
-                logger.debug(f"Sherpa hint '{pq.sherpa_hint}' appears in query but not as valid pattern - keeping it")
+                # Hint appears in text (e.g. "sherpa", "by") but is not a specific tug ID — clear it
+                logger.info(f"Clearing sherpa_hint '{pq.sherpa_hint}' — appears in query but not as a valid tug-NNN pattern")
+                pq.sherpa_hint = None
 
     # sanitize
     if pq.item and pq.item not in ALLOWED_ITEMS:
