@@ -10,6 +10,7 @@ This follows MCP best practices:
 
 from __future__ import annotations
 
+import json as _json
 import logging
 import os
 import sys
@@ -52,6 +53,8 @@ mcp = FastMCP(
         "Prompts provide templates for common query patterns."
     )
 )
+# Disable DNS rebinding protection so Docker containers can connect by service name
+mcp.settings.transport_security.enable_dns_rebinding_protection = False
 
 BASE_URL = "https://sanjaya.atimotors.com"
 
@@ -524,34 +527,218 @@ async def resolve_fleet_name(
 
 
 # ============================================================================
-# Simple natural language interface (returns plain text)
+# List tools — return JSON arrays for programmatic clients (e.g. Streamlit)
 # ============================================================================
 
 @mcp.tool()
-async def sanjaya_chat(text: str) -> str:
-    """Simple natural language query interface.
+async def list_clients_tool() -> str:
+    """Return all client names as a JSON array.
 
-    Parses natural language and runs the 3-turn flow: query → proceed/cancel → schedule.
-    For programmatic access use the focused tools: get_analytics_summary and get_metric.
+    Example response: ["YOKOHAMA-DAHEJ", "CEAT-Nagpur"]
+    """
+    await client.ensure_token()
+    clients = await client_cache.get_or_set("all_clients", client.get_clients)
+    names = sorted(
+        c.get("fm_client_name") for c in clients
+        if isinstance(c, dict) and c.get("fm_client_name")
+    )
+    return _json.dumps(names)
+
+
+@mcp.tool()
+async def list_fleets_tool(client_name: str) -> str:
+    """Return all fleet names for a client as a JSON array.
 
     Args:
-        text: Natural language query (e.g., "total trips today for ceat-nagpur")
+        client_name: Exact client name (e.g., "YOKOHAMA-DAHEJ")
     """
-    return await handle_chat(
-        text,
-        api=client,
-        client_cache=client_cache,
-        client_details_cache=client_details_cache,
-        sherpa_cache=sherpa_cache,
-        project_root=_PROJECT_ROOT,
-        defaults=_defaults(),
-        get_metric_data_fn=_get_metric_response_and_data,
-        fetch_analytics_fn=_fetch_analytics_data_and_summary,
-        send_text_report_fn=_generate_and_send_text_report,
+    await client.ensure_token()
+    clients = await client_cache.get_or_set("all_clients", client.get_clients)
+    client_id = next(
+        (c.get("fm_client_id") for c in clients
+         if isinstance(c, dict)
+         and (c.get("fm_client_name") or "").lower() == client_name.lower()),
+        None,
     )
+    if not client_id:
+        return _json.dumps([])
+    details = await client_details_cache.get_or_set(
+        f"client_details_{client_id}", client.get_client_by_id, client_id
+    )
+    return _json.dumps(sorted(details.get("fm_fleet_names", [])))
+
+
+@mcp.tool()
+async def list_sherpas_tool(client_name: str, fleet_names: List[str]) -> str:
+    """Return all sherpa names for a client across the given fleets as a JSON array.
+
+    Args:
+        client_name: Exact client name
+        fleet_names: List of fleet names to include
+    """
+    await client.ensure_token()
+    clients = await client_cache.get_or_set("all_clients", client.get_clients)
+    client_id = next(
+        (c.get("fm_client_id") for c in clients
+         if isinstance(c, dict)
+         and (c.get("fm_client_name") or "").lower() == client_name.lower()),
+        None,
+    )
+    if not client_id:
+        return _json.dumps([])
+    cache_key = f"sherpas_client_{client_id}"
+    all_sherpas = await sherpa_cache.get_or_set(
+        cache_key, client.get_sherpas_by_client_id, client_id
+    )
+    fleet_lower = {f.lower() for f in fleet_names}
+    names = sorted(set(
+        s.get("sherpa_name") for s in all_sherpas
+        if isinstance(s, dict)
+        and (s.get("fleet_name") or "").lower() in fleet_lower
+        and s.get("sherpa_name")
+    ))
+    return _json.dumps(names)
+
+
+# ============================================================================
+# Multi-fleet helper (used by sanjaya_chat when fleet_names has 2+ entries)
+# ============================================================================
+
+async def _handle_multi_fleet_chat(
+    text: str,
+    client_name: str,
+    fleet_names: List[str],
+    time_phrase: str,
+    timezone: str,
+) -> str:
+    from src.nlu import parse_query as _nlu_parse
+    from src.scheduling import _save_pending_report
+
+    nlu_defaults = {
+        "fm_client_name": "", "fleet_name": "",
+        "timezone": timezone, "time_phrase": time_phrase,
+    }
+    try:
+        pq = await _nlu_parse(text, defaults=nlu_defaults)
+    except Exception:
+        pq = None
+
+    fleet_parts, all_texts, time_strings = [], [], {}
+    for fleet in fleet_names:
+        try:
+            if pq and pq.intent == "multi_metric" and len(pq.items) > 1:
+                parts = []
+                for metric in pq.items:
+                    t, _, ts = await _get_metric_response_and_data(
+                        metric, client_name, fleet, time_phrase, timezone
+                    )
+                    parts.append(t)
+                    time_strings = ts
+                fleet_text = "\n\n".join(parts)
+            elif pq and pq.intent == "basic_analytics_item" and pq.item:
+                fleet_text, _, time_strings = await _get_metric_response_and_data(
+                    pq.item, client_name, fleet, time_phrase, timezone
+                )
+            else:
+                fleet_text, _, time_strings = await _fetch_analytics_data_and_summary(
+                    client_name, fleet, time_phrase, timezone
+                )
+        except Exception as e:
+            fleet_text = f"Error fetching data for {fleet}: {e}"
+
+        fleet_parts.append(f"### Fleet: {fleet}\n\n{fleet_text}")
+        all_texts.append(fleet_text)
+
+    combined = "\n\n---\n\n".join(fleet_parts)
+    _save_pending_report(
+        client_name, ", ".join(fleet_names), time_phrase, timezone,
+        time_strings, "\n\n---\n\n".join(all_texts), text, sections=None,
+    )
+    return combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
+
+
+# ============================================================================
+# Natural language chat interface
+# ============================================================================
+
+@mcp.tool()
+async def sanjaya_chat(
+    text: str,
+    client_name: Optional[str] = None,
+    fleet_name: Optional[str] = None,
+    fleet_names: Optional[List[str]] = None,
+    time_phrase: Optional[str] = None,
+    timezone: Optional[str] = None,
+    recipient_email: Optional[str] = None,
+) -> str:
+    """Natural language chat interface — single entry point for all queries.
+
+    Handles single/multi-fleet, single/multi-metric, proceed/cancel, and scheduling.
+    Sidebar context (client, fleet, time) passed as optional params overrides env defaults.
+
+    Args:
+        text:            Natural language query or control command (proceed, cancel, daily 8, …)
+        client_name:     Client to query (overrides SANJAYA_DEFAULT_CLIENT env var)
+        fleet_name:      Single fleet (overrides SANJAYA_DEFAULT_FLEET env var)
+        fleet_names:     Multiple fleets — triggers per-fleet fan-out when 2+ provided
+        time_phrase:     Time range string (e.g. "yesterday", "last 7 days")
+        timezone:        IANA timezone (e.g. "Asia/Kolkata")
+        recipient_email: Override REPORT_RECIPIENT for this request only
+    """
+    d = _defaults()
+    if client_name:
+        d["fm_client_name"] = client_name
+    if fleet_name:
+        d["fleet_name"] = fleet_name
+    elif fleet_names and len(fleet_names) == 1:
+        d["fleet_name"] = fleet_names[0]
+    if time_phrase:
+        d["time_phrase"] = time_phrase
+    if timezone:
+        d["timezone"] = timezone
+
+    # Temporarily override email recipient if provided
+    _old_recipient = os.environ.get("REPORT_RECIPIENT", "")
+    if recipient_email:
+        os.environ["REPORT_RECIPIENT"] = recipient_email
+
+    try:
+        # Multi-fleet: fan out per fleet on the server side
+        if fleet_names and len(fleet_names) > 1:
+            resolved_tz     = d.get("timezone", "Asia/Kolkata")
+            resolved_time   = d.get("time_phrase", "yesterday")
+            resolved_client = d.get("fm_client_name", "")
+            return await _handle_multi_fleet_chat(
+                text, resolved_client, fleet_names, resolved_time, resolved_tz
+            )
+
+        return await handle_chat(
+            text,
+            api=client,
+            client_cache=client_cache,
+            client_details_cache=client_details_cache,
+            sherpa_cache=sherpa_cache,
+            project_root=_PROJECT_ROOT,
+            defaults=d,
+            get_metric_data_fn=_get_metric_response_and_data,
+            fetch_analytics_fn=_fetch_analytics_data_and_summary,
+            send_text_report_fn=_generate_and_send_text_report,
+        )
+    finally:
+        os.environ["REPORT_RECIPIENT"] = _old_recipient
 
 
 if __name__ == "__main__":
-    logger.info("Starting Sanjaya Analytics MCP Server (standard MCP patterns)...")
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if len(sys.argv) > 1 and sys.argv[1] in ("stdio", "sse", "streamable-http"):
+        transport = sys.argv[1]
+    logger.info("Starting Sanjaya Analytics MCP Server (transport=%s)...", transport)
+    if transport == "sse":
+        import uvicorn
+        uvicorn.run(mcp.sse_app(), host="0.0.0.0", port=8000)
+    elif transport == "streamable-http":
+        import uvicorn
+        uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=8000)
+    else:
+        mcp.run()
 

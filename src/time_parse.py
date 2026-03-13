@@ -98,12 +98,42 @@ def parse_time_range(
     now = (now or datetime.now(tz)).astimezone(tz)
 
     raw = text or ""
+    # Normalize a.m./a.m/p.m./p.m → am/pm (trailing dot optional)
+    raw = re.sub(r'\ba\.m\.?', 'am', raw, flags=re.IGNORECASE)
+    raw = re.sub(r'\bp\.m\.?', 'pm', raw, flags=re.IGNORECASE)
     t = raw.strip().lower()
 
     # Helper to match inside longer sentences:
     # e.g. "total trips today" should match today
     def has(phrase: str) -> bool:
         return phrase in t
+
+    # ---- Hour-qualified day ranges (must come before keyword shortcuts) ------
+    # Catches: "yesterday 7am to 7pm", "today 9:00 to 17:00", "7am to 7pm yesterday"
+    _TIME_PAT = r"\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2}"
+    _DAY_PAT  = r"yesterday|today|day before yesterday"
+    hr = re.search(
+        rf"({_DAY_PAT})\s+({_TIME_PAT})\s+to\s+({_TIME_PAT})",
+        t, re.IGNORECASE,
+    )
+    if not hr:
+        hr = re.search(
+            rf"({_TIME_PAT})\s+to\s+({_TIME_PAT})\s+({_DAY_PAT})",
+            t, re.IGNORECASE,
+        )
+    if hr:
+        # Pass the full matched phrase to the " to " branch below via synthetic text
+        phrase = hr.group(0).strip()
+        left, right = phrase.split(" to ", 1)
+        left, right = left.strip(), right.strip()
+        start_dt = _parse_date_like(left, tz)
+        end_dt   = _parse_date_like(right, tz)
+        if start_dt and end_dt:
+            if _is_time_only(right):
+                end_dt = end_dt.replace(
+                    year=start_dt.year, month=start_dt.month, day=start_dt.day
+                )
+            return TimeRange(start_dt.replace(microsecond=0), end_dt.replace(microsecond=0))
 
     # ---- Quick keywords ----
     if has("today"):
@@ -176,13 +206,29 @@ def parse_time_range(
         end = datetime(year, 12, 31, 23, 59, 59, tzinfo=tz)
         return TimeRange(start, end)
 
-    # ---- Explicit range "X to Y" ----
+    # ---- Explicit range "X to Y" (date or time ranges) ----
     if " to " in t:
         left, right = t.split(" to ", 1)
-        start_dt = _parse_date_like(left.strip(), tz)
-        end_dt = _parse_date_like(right.strip(), tz)
+        left, right = left.strip(), right.strip()
+        start_dt = _parse_date_like(left, tz)
+        end_dt   = _parse_date_like(right, tz)
         if start_dt and end_dt:
-            return TimeRange(_start_of_day(start_dt), _end_of_day(end_dt))
+            left_has_time  = _has_time_component(left)
+            right_has_time = _has_time_component(right)
+            # If right side is a bare time ("7 pm") inherit the date from start_dt
+            if right_has_time and _is_time_only(right):
+                end_dt = end_dt.replace(
+                    year=start_dt.year, month=start_dt.month, day=start_dt.day
+                )
+            if left_has_time and right_has_time:
+                # Both sides carry an explicit hour → use them as-is
+                return TimeRange(start_dt.replace(microsecond=0), end_dt.replace(microsecond=0))
+            elif left_has_time:
+                return TimeRange(start_dt.replace(microsecond=0), _end_of_day(end_dt))
+            elif right_has_time:
+                return TimeRange(_start_of_day(start_dt), end_dt.replace(microsecond=0))
+            else:
+                return TimeRange(_start_of_day(start_dt), _end_of_day(end_dt))
 
     # ---- Single explicit date ----
     dt = _parse_date_like(t, tz)
@@ -214,6 +260,30 @@ def parse_time_range(
 
     # Default: today so far
     return TimeRange(_start_of_day(now), now.replace(microsecond=0))
+
+
+def _has_time_component(text: str) -> bool:
+    """Return True if text has an explicit hour (7am, 7:00, 07:00 am, 8 a.m., etc.)."""
+    t = re.sub(r'\ba\.m\.?', 'am', text.lower(), flags=re.IGNORECASE)
+    t = re.sub(r'\bp\.m\.?', 'pm', t, flags=re.IGNORECASE)
+    return bool(
+        re.search(r"\b\d{1,2}:\d{2}\b", t) or
+        re.search(r"\b\d{1,2}\s*(?:am|pm)\b", t)
+    )
+
+
+def _is_time_only(text: str) -> bool:
+    """Return True if text is a bare time with no date context (e.g. '7 pm', '19:00')."""
+    t = text.lower().strip()
+    if not _has_time_component(t):
+        return False
+    # Date indicators
+    has_date = bool(
+        re.search(r"\b\d{4}\b", t) or
+        re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b", t) or
+        any(k in t for k in ("yesterday", "today", "last", "this", "previous"))
+    )
+    return not has_date
 
 
 def _parse_date_like(text: str, tz: ZoneInfo) -> Optional[datetime]:

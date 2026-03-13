@@ -19,9 +19,10 @@ logger = logging.getLogger("fm_mcp")
 # Project root is one directory above this file (src/ → project root)
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-PENDING_REPORT_FILE    = os.path.join(_PROJECT_ROOT, "pending_report.json")
-PENDING_SCHEDULE_FILE  = os.path.join(_PROJECT_ROOT, "pending_schedule.json")
-CLIENT_REPORT_CONFIG_FILE = os.path.join(_PROJECT_ROOT, "client_report_config.json")
+PENDING_REPORT_FILE         = os.path.join(_PROJECT_ROOT, "pending_report.json")
+PENDING_SCHEDULE_FILE       = os.path.join(_PROJECT_ROOT, "pending_schedule.json")
+PENDING_CLARIFICATION_FILE  = os.path.join(_PROJECT_ROOT, "pending_clarification.json")
+CLIENT_REPORT_CONFIG_FILE   = os.path.join(_PROJECT_ROOT, "client_report_config.json")
 
 
 # ── Section mapping ────────────────────────────────────────────────────────
@@ -188,6 +189,37 @@ def _clear_pending_schedule() -> None:
     try:
         if os.path.isfile(PENDING_SCHEDULE_FILE):
             os.remove(PENDING_SCHEDULE_FILE)
+    except Exception:
+        pass
+
+
+# ── Pending clarification state ───────────────────────────────────────────
+# Saved when NLU can't extract a required field (client_name, time_phrase).
+# Stores the partial ParsedQuery so chat_handler can resume once the user answers.
+
+def _save_pending_clarification(missing_field: str, partial_pq: dict) -> None:
+    """Save what's missing and the partial parsed query so we can resume."""
+    try:
+        with open(PENDING_CLARIFICATION_FILE, "w", encoding="utf-8") as f:
+            _json.dump({"missing_field": missing_field, "partial_pq": partial_pq}, f)
+    except Exception:
+        pass
+
+
+def _load_pending_clarification() -> Optional[dict]:
+    if not os.path.isfile(PENDING_CLARIFICATION_FILE):
+        return None
+    try:
+        with open(PENDING_CLARIFICATION_FILE, encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception:
+        return None
+
+
+def _clear_pending_clarification() -> None:
+    try:
+        if os.path.isfile(PENDING_CLARIFICATION_FILE):
+            os.remove(PENDING_CLARIFICATION_FILE)
     except Exception:
         pass
 

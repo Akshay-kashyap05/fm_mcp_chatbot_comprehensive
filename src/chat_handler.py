@@ -13,22 +13,67 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from src.nlu import parse_query
+from src.client_match import resolve_client, resolve_client_candidates, scan_prompt_for_client
 from src.scheduling import (
     CLIENT_REPORT_CONFIG_FILE,
     _DAY_NAMES,
     _SCHEDULE_TIME_PHRASE,
     _add_or_update_client_config,
+    _clear_pending_clarification,
     _clear_pending_report,
     _clear_pending_schedule,
     _item_to_section_names,
+    _load_pending_clarification,
     _load_pending_report,
     _load_pending_schedule,
     _parse_schedule_command,
+    _save_pending_clarification,
     _save_pending_report,
     _save_pending_schedule,
 )
 
 logger = logging.getLogger("fm_mcp")
+
+
+def _fmt_time_header(time_strings: dict, client_name: str, fleet_name: str) -> str:
+    """Return a one-line markdown header showing the query period."""
+    start = time_strings.get("start_time", "")
+    end   = time_strings.get("end_time",   "")
+    # Convert "YYYY-MM-DD HH:MM:SS" → "DD Mon YYYY HH:MM"
+    def _nice(ts: str) -> str:
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            return dt.strftime("%-d %b %Y %H:%M")
+        except Exception:
+            return ts
+    context = f"{client_name}"
+    if fleet_name:
+        context += f" / {fleet_name}"
+    return f"**{context}** &nbsp;|&nbsp; 📅 {_nice(start)} → {_nice(end)}\n\n---\n"
+
+
+_SCHEDULE_WORDS = {"daily", "weekly", "hourly", "skip", "every", "monday", "tuesday",
+                   "wednesday", "thursday", "friday", "saturday", "sunday"}
+_ANALYTICS_WORDS = {
+    "utilization", "uptime", "trips", "distance", "analytics", "status",
+    "takt", "obstacle", "sherpa", "tug", "bot", "fleet", "client",
+    "give", "show", "get", "what", "how", "report", "summary",
+    "yesterday", "today", "week", "month", "last", "this",
+}
+
+
+def _looks_like_new_query(text: str) -> bool:
+    """Return True if text looks like an analytics query rather than a schedule response."""
+    words = text.lower().strip().split()
+    # Short texts that only contain schedule words → let the schedule handler deal with it
+    if len(words) <= 3 and any(w in _SCHEDULE_WORDS for w in words):
+        return False
+    # Any analytics indicator → new query
+    if any(w in _ANALYTICS_WORDS for w in words):
+        return True
+    # Long sentences are almost certainly new queries
+    return len(words) > 5
 
 
 async def handle_chat(
@@ -59,6 +104,61 @@ async def handle_chat(
     send_text_report_fn Callable = _generate_and_send_text_report
     """
     logger.info("sanjaya_chat called with query: %s", text)
+
+    # ── Pending clarification: user is answering a question we asked ───────
+    # e.g. we asked "which client?" and user replied "YOKOHAMA-DAHEJ"
+    pending_clarif = _load_pending_clarification()
+    if pending_clarif and _looks_like_new_query(text):
+        # User typed a brand-new analytics query — discard stale clarification state
+        logger.info("Stale pending_clarification detected; clearing and processing as new query.")
+        _clear_pending_clarification()
+        pending_clarif = None
+    if pending_clarif:
+        missing_field = pending_clarif.get("missing_field")
+        partial_pq    = pending_clarif.get("partial_pq", {})
+        answer        = text.strip()
+        _clear_pending_clarification()
+        logger.info("Resuming from clarification: missing_field=%s, answer=%s", missing_field, answer)
+
+        if missing_field == "client_name_confirm":
+            # User is confirming (or correcting) a suggested client name
+            if answer.lower() in ("yes", "y", "confirm", "yeah", "yep", "ok"):
+                # Confirmed — use the pre-suggested client name
+                partial_pq["fm_client_name"] = partial_pq.get("suggested_client")
+            else:
+                # User typed the real name; treat it as the new client name
+                partial_pq["fm_client_name"] = answer
+        elif missing_field == "client_name":
+            partial_pq["fm_client_name"] = answer
+        elif missing_field == "time_phrase":
+            partial_pq["time_phrase"] = answer
+
+        # Reconstruct a synthetic prompt and re-enter the main flow
+        # by injecting the answer into the partial query fields
+        from src.nlu import ParsedQuery
+        pq_resumed = ParsedQuery(
+            intent      = partial_pq.get("intent", "basic_analytics"),
+            item        = partial_pq.get("item"),
+            items       = partial_pq.get("items", []),
+            sherpa_hint = partial_pq.get("sherpa_hint"),
+            fm_client_name = partial_pq.get("fm_client_name"),
+            fleet_name  = partial_pq.get("fleet_name"),
+            timezone    = partial_pq.get("timezone"),
+            time_phrase = partial_pq.get("time_phrase"),
+        )
+        # Fall through to the main query block using the resumed ParsedQuery
+        return await _execute_query(
+            pq=pq_resumed,
+            original_text=partial_pq.get("original_text", text),
+            defaults=defaults,
+            api=api,
+            client_cache=client_cache,
+            client_details_cache=client_details_cache,
+            sherpa_cache=sherpa_cache,
+            get_metric_data_fn=get_metric_data_fn,
+            fetch_analytics_fn=fetch_analytics_fn,
+            send_text_report_fn=send_text_report_fn,
+        )
 
     # ── Proceed / Cancel ──────────────────────────────────────────────────
     cmd = text.strip().lower()
@@ -98,9 +198,14 @@ async def handle_chat(
             logger.warning("Failed to send pending report: %s", e)
             return f"Failed to send report: {e}"
 
-    if cmd in ("cancel", "no", "skip") and _load_pending_report():
-        _clear_pending_report()
-        return "Report cancelled. No email sent."
+    if cmd in ("cancel", "no", "skip"):
+        if _load_pending_report():
+            _clear_pending_report()
+            return "Report cancelled. No email sent."
+        if not _load_pending_schedule():
+            # Nothing pending at all — return gracefully instead of falling through to NLU
+            return "No active report to cancel."
+        # pending_sched exists: fall through to the schedule handler below
 
     # ── Schedule response (after email was sent) ──────────────────────────
     pending_sched = _load_pending_schedule()
@@ -112,15 +217,22 @@ async def handle_chat(
             return "OK — report was sent once, no recurring schedule added."
 
         if "error" in schedule:
-            return (
-                schedule["error"] + "\n\n"
-                "Please try again:\n"
-                "- `daily 8` — every day at 08:00\n"
-                "- `hourly` — every hour\n"
-                "- `every 20 mins` — every 20 minutes (for testing)\n"
-                "- `weekly monday 8` — every Monday at 08:00\n"
-                "- `skip` — no scheduling\n"
-            )
+            # If the message looks like a new analytics query (not a schedule response),
+            # clear stale pending_sched and fall through to NLU instead of showing an error.
+            if _looks_like_new_query(text):
+                logger.info("Stale pending_schedule detected; message looks like a new query — clearing state.")
+                _clear_pending_schedule()
+                # Fall through to the main NLU block below
+            else:
+                return (
+                    schedule["error"] + "\n\n"
+                    "Please try again:\n"
+                    "- `daily 8` — every day at 08:00\n"
+                    "- `hourly` — every hour\n"
+                    "- `every 20 mins` — every 20 minutes (for testing)\n"
+                    "- `weekly monday 8` — every Monday at 08:00\n"
+                    "- `skip` — no scheduling\n"
+                )
 
         sched_type = schedule["schedule_type"]
         time_phrase = pending_sched.get("time_phrase") or _SCHEDULE_TIME_PHRASE.get(sched_type, "yesterday")
@@ -215,141 +327,356 @@ Available Prompts:
 - metric_query: Template for metric queries
 """
 
-        # Apply defaults — track whether client came from NLU or fallback
-        client_from_nlu = bool(pq.fm_client_name)
-        client_name = pq.fm_client_name or defaults.get("fm_client_name")
-        fleet_name = pq.fleet_name
-        if not fleet_name and not pq.fm_client_name:
-            fleet_name = defaults.get("fleet_name")
-        time_phrase = pq.time_phrase or defaults.get("time_phrase", "today")
-        timezone = pq.timezone
-        if not timezone or str(timezone).lower() in ("null", "none", ""):
-            timezone = defaults.get("timezone") or "Asia/Kolkata"
-        else:
-            timezone = str(timezone)
+        return await _execute_query(
+            pq=pq,
+            original_text=clean_text,
+            defaults=defaults,
+            api=api,
+            client_cache=client_cache,
+            client_details_cache=client_details_cache,
+            sherpa_cache=sherpa_cache,
+            get_metric_data_fn=get_metric_data_fn,
+            fetch_analytics_fn=fetch_analytics_fn,
+            send_text_report_fn=send_text_report_fn,
+        )
 
-        # ── Client/fleet swap correction ──────────────────────────────────
-        # Fires when: NLU left client empty and put the client name in fleet_name.
-        # Also fires when client came from defaults (not NLU) and fleet_name matches a real client.
+    except Exception as e:
+        logger.error("Error in sanjaya_chat: %s", e)
+        return f"Error: {str(e)}"
+
+
+async def _execute_query(
+    pq,
+    original_text: str,
+    *,
+    defaults: dict,
+    api,
+    client_cache,
+    client_details_cache,
+    sherpa_cache,
+    get_metric_data_fn: Callable,
+    fetch_analytics_fn: Callable,
+    send_text_report_fn: Callable,
+) -> str:
+    """Resolve names, validate required fields (asking user if missing), then fetch data."""
+
+    # Prompt-first mode: client and fleet MUST come from NLU (the user's prompt).
+    # We do NOT fall back to env defaults for those — if they're missing we ask.
+    # Timezone is safe to default (user rarely types it). Time phrase we ask for if absent.
+    client_from_nlu = bool(pq.fm_client_name)
+    client_name = pq.fm_client_name or None          # never use env default for client
+    fleet_name  = pq.fleet_name or None              # never use env default for fleet
+    time_phrase = pq.time_phrase or defaults.get("time_phrase") or None   # ask if still None
+    timezone    = pq.timezone
+    if not timezone or str(timezone).lower() in ("null", "none", ""):
+        timezone = defaults.get("timezone") or "Asia/Kolkata"
+    else:
+        timezone = str(timezone)
+
+    # ── Client name resolution (exact + fuzzy via RapidFuzz) ──────────
+    # Also detects NLU swap where client name ended up in fleet_name.
+    try:
+        await api.ensure_token()
+        all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
+
+        # Swap correction: NLU put a client name into fleet_name
+        if (not client_from_nlu) and fleet_name:
+            swap_match = resolve_client(fleet_name, all_clients)
+            if swap_match:
+                logger.info("Correcting NLU swap: treating fleet_name '%s' as client_name", fleet_name)
+                client_name = swap_match.get("fm_client_name")
+                fleet_name = None
+
+        # Pre-resolution prompt scan: NLU returned no client name but the user
+        # may have typed it without a 'client' keyword (e.g. "utilization for yokohoma dahej").
+        # Always ask for confirmation rather than silently picking — avoids wrong guesses.
+        if not client_name:
+            scan_match, scan_score = scan_prompt_for_client(original_text, all_clients)
+            if scan_match:
+                suggested = scan_match.get("fm_client_name")
+                logger.info("Prompt scan suggests client: '%s' (score=%.1f)", suggested, scan_score)
+                _save_pending_clarification(
+                    missing_field="client_name_confirm",
+                    partial_pq={
+                        "intent":           pq.intent,
+                        "item":             pq.item,
+                        "items":            pq.items,
+                        "sherpa_hint":      pq.sherpa_hint,
+                        "fleet_name":       fleet_name,
+                        "timezone":         timezone,
+                        "time_phrase":      time_phrase,
+                        "original_text":    original_text,
+                        "suggested_client": suggested,
+                    },
+                )
+                return (
+                    f"Did you mean client **{suggested}**?\n\n"
+                    "Reply `yes` to confirm, or type the correct client name."
+                )
+
+        # Normalise client_name to exact API spelling (handles wrong case / typos)
+        if client_name:
+            candidates = resolve_client_candidates(client_name, all_clients)
+            if len(candidates) == 1:
+                # Unambiguous match
+                matched = candidates[0][0]
+                client_name = matched.get("fm_client_name")
+                client_id_for_fleet = matched.get("fm_client_id")
+            elif len(candidates) > 1:
+                # Multiple close matches — ask the user to pick
+                options = [d.get("fm_client_name") for d, _ in candidates]
+                options_list = "\n".join(f"- `{n}`" for n in options)
+                _save_pending_clarification(
+                    missing_field="client_name",
+                    partial_pq={
+                        "intent":        pq.intent,
+                        "item":          pq.item,
+                        "items":         pq.items,
+                        "sherpa_hint":   pq.sherpa_hint,
+                        "fleet_name":    fleet_name,
+                        "timezone":      timezone,
+                        "time_phrase":   time_phrase,
+                        "original_text": original_text,
+                    },
+                )
+                return (
+                    f"I found multiple close matches for **\"{client_name}\"**:\n\n"
+                    + options_list
+                    + "\n\nWhich one did you mean? Type the exact name."
+                )
+            else:
+                # No match above threshold — tell the user instead of guessing
+                names = sorted(
+                    c.get("fm_client_name") for c in all_clients
+                    if isinstance(c, dict) and c.get("fm_client_name")
+                )
+                names_list = "\n".join(f"- `{n}`" for n in names)
+                return (
+                    f"I couldn't find a client close to **\"{client_name}\"**. "
+                    "Please check the spelling or choose one from the list:\n\n"
+                    + names_list
+                )
+        else:
+            client_id_for_fleet = None
+
+        # ── Fleet name case correction ─────────────────────────────────
+        # Ollama often returns wrong case (e.g. "Bead" instead of "BEAD").
+        if client_name and fleet_name and client_id_for_fleet:
+            try:
+                cache_key = f"client_details_{client_id_for_fleet}"
+                client_details = await client_details_cache.get_or_set(
+                    cache_key, api.get_client_by_id, client_id_for_fleet
+                )
+                if client_details:
+                    for real_fleet in client_details.get("fm_fleet_names", []):
+                        if real_fleet.lower() == fleet_name.lower():
+                            if real_fleet != fleet_name:
+                                logger.info("Correcting fleet name case: '%s' → '%s'", fleet_name, real_fleet)
+                                fleet_name = real_fleet
+                            break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ── Missing client_name — ask the user ────────────────────────────
+    if not client_name:
+        try:
+            all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
+            names = sorted(
+                c.get("fm_client_name") for c in all_clients
+                if isinstance(c, dict) and c.get("fm_client_name")
+            )
+        except Exception:
+            names = []
+
+        # Save partial query so we can resume when the user answers
+        _save_pending_clarification(
+            missing_field="client_name",
+            partial_pq={
+                "intent":       pq.intent,
+                "item":         pq.item,
+                "items":        pq.items,
+                "sherpa_hint":  pq.sherpa_hint,
+                "fleet_name":   fleet_name,
+                "timezone":     timezone,
+                "time_phrase":  time_phrase,
+                "original_text": original_text,
+            },
+        )
+        if names:
+            names_list = "\n".join(f"- `{n}`" for n in names)
+            return (
+                "I couldn't find a client name in your message. "
+                "Which client do you want? Just type the name.\n\n"
+                + names_list
+            )
+        return (
+            "I couldn't find a client name in your message. "
+            "Please type the client name (e.g. `YOKOHAMA-DAHEJ`)."
+        )
+
+    # ── Missing time_phrase — ask the user ────────────────────────────
+    # Only ask when no time phrase at all was extracted (not even a default).
+    # We skip this check if time_phrase already has a value from defaults.
+    if not time_phrase:
+        _save_pending_clarification(
+            missing_field="time_phrase",
+            partial_pq={
+                "intent":        pq.intent,
+                "item":          pq.item,
+                "items":         pq.items,
+                "sherpa_hint":   pq.sherpa_hint,
+                "fm_client_name": client_name,
+                "fleet_name":    fleet_name,
+                "timezone":      timezone,
+                "time_phrase":   None,
+                "original_text": original_text,
+            },
+        )
+        return (
+            "What time period do you want data for?\n\n"
+            "- `today`\n"
+            "- `yesterday`\n"
+            "- `this week`\n"
+            "- `this month`\n"
+            "- `last month`\n"
+            "- `1 Jan 2026 to 10 Jan 2026` (custom range)"
+        )
+
+    # ── Fleet auto-resolution ─────────────────────────────────────────
+    # Builds all_fleet_names so we can query all fleets when none is specified.
+    # Reuses client_id_for_fleet resolved above; falls back to a fresh lookup.
+    all_fleet_names: List[str] = []
+    if client_name and not fleet_name:
         try:
             await api.ensure_token()
-            all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
-            if (not client_from_nlu) and fleet_name:
-                for c in all_clients:
-                    if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == fleet_name.lower():
-                        logger.info("Correcting NLU swap: treating fleet_name '%s' as client_name", fleet_name)
-                        client_name = c.get("fm_client_name")
-                        fleet_name = None
-                        break
-            if client_name:
-                for c in all_clients:
-                    if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == client_name.lower():
-                        client_name = c.get("fm_client_name")
-                        break
-        except Exception:
-            pass
-
-        # ── Fleet auto-resolution ─────────────────────────────────────────
-        if client_name and not fleet_name:
-            try:
+            client_id = client_id_for_fleet  # already resolved above (may be None)
+            if not client_id:
+                # Fallback: re-resolve (handles the case where correction block was skipped)
                 all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
-                client_id = None
-                for c in all_clients:
-                    if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == client_name.lower():
-                        client_id = c.get("fm_client_id")
-                        break
-                if client_id:
-                    cache_key = f"client_details_{client_id}"
-                    client_details = await client_details_cache.get_or_set(
-                        cache_key, api.get_client_by_id, client_id
-                    )
-                    fleet_names = client_details.get("fm_fleet_names", [])
-                    if len(fleet_names) == 1:
-                        fleet_name = fleet_names[0]
-                        logger.info("Auto-resolved fleet for client %s: %s", client_name, fleet_name)
-                    elif fleet_names:
-                        import json as _json
-                        if os.path.isfile(CLIENT_REPORT_CONFIG_FILE):
-                            try:
-                                with open(CLIENT_REPORT_CONFIG_FILE, "r", encoding="utf-8") as _f:
-                                    _configs = _json.load(_f)
-                                for _cfg in _configs:
-                                    if isinstance(_cfg, dict) and _cfg.get("client_name", "").lower() == client_name.lower():
-                                        fleet_name = _cfg.get("fleet_name")
-                                        logger.info("Resolved fleet from config for client %s: %s", client_name, fleet_name)
-                                        break
-                            except Exception:
-                                pass
-                        if not fleet_name:
-                            return (
-                                f"Client **{client_name}** has multiple fleets: "
-                                + ", ".join(f"`{f}`" for f in fleet_names)
-                                + ". Please specify the fleet in your query."
-                            )
-            except Exception as e:
-                logger.warning("Fleet auto-resolve failed: %s", e)
-
-        if not client_name or not fleet_name:
-            return (
-                "Error: Client name and fleet name are required. "
-                "Use resolve_client_name and resolve_fleet_name tools to find them, "
-                "or specify in your query."
-            )
-
-        api_sherpa_name = pq.sherpa_hint
-        if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
-            api_sherpa_name = None
-
-        # ── Multi-metric: call each endpoint and combine ──────────────────
-        if pq.intent == "multi_metric" and len(pq.items) > 1:
-            parts, time_strings = [], {}
-            for metric in pq.items:
-                metric_response, _, ts = await get_metric_data_fn(
-                    metric=metric,
-                    client_name=client_name,
-                    fleet_name=fleet_name,
-                    time_range=time_phrase,
-                    timezone=timezone,
-                    sherpa_name=api_sherpa_name,
+                matched = resolve_client(client_name, all_clients)
+                client_id = matched.get("fm_client_id") if matched else None
+            if client_id:
+                cache_key = f"client_details_{client_id}"
+                client_details = await client_details_cache.get_or_set(
+                    cache_key, api.get_client_by_id, client_id
                 )
-                parts.append(metric_response)
-                time_strings = ts
-            combined = "\n\n".join(parts)
-            _save_pending_report(
-                client_name, fleet_name, time_phrase, timezone,
-                time_strings, combined, clean_text, sections=None,
-            )
-            return combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
+                if client_details:
+                    all_fleet_names = client_details.get("fm_fleet_names", [])
+                if len(all_fleet_names) == 1:
+                    fleet_name = all_fleet_names[0]
+                    logger.info("Auto-resolved single fleet for client %s: %s", client_name, fleet_name)
+                elif all_fleet_names:
+                    # Multiple fleets and none specified — query all of them
+                    logger.info("No fleet specified for client %s — will query all %d fleets: %s", client_name, len(all_fleet_names), all_fleet_names)
+            else:
+                logger.warning("Client '%s' not found in client list (client_id is None)", client_name)
+        except Exception as e:
+            logger.warning("Fleet auto-resolve failed: %s", e)
 
-        # ── Single metric ─────────────────────────────────────────────────
-        if pq.intent == "basic_analytics_item" and pq.item:
-            metric_response, data, time_strings = await get_metric_data_fn(
-                metric=pq.item,
+    api_sherpa_name = pq.sherpa_hint
+    if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
+        api_sherpa_name = None
+
+    # ── All-fleets mode: no fleet specified, query each fleet and combine ──
+    fleets_to_query: List[str] = [fleet_name] if fleet_name else all_fleet_names
+    if not fleets_to_query:
+        return (
+            f"I couldn't find any fleets for client **{client_name}**. "
+            "Please check the client name or contact support."
+        )
+
+    if len(fleets_to_query) > 1:
+        logger.info("Querying all %d fleets for client %s: %s", len(fleets_to_query), client_name, fleets_to_query)
+        fleet_parts, time_strings = [], {}
+        for fl in fleets_to_query:
+            try:
+                if pq.intent == "multi_metric" and len(pq.items) > 1:
+                    metric_parts = []
+                    for metric in pq.items:
+                        resp, _, ts = await get_metric_data_fn(
+                            metric=metric, client_name=client_name, fleet_name=fl,
+                            time_range=time_phrase, timezone=timezone, sherpa_name=api_sherpa_name,
+                        )
+                        metric_parts.append(resp)
+                        time_strings = ts
+                    fleet_parts.append(f"**Fleet: {fl}**\n\n" + "\n\n".join(metric_parts))
+                elif pq.intent == "basic_analytics_item" and pq.item:
+                    resp, _, ts = await get_metric_data_fn(
+                        metric=pq.item, client_name=client_name, fleet_name=fl,
+                        time_range=time_phrase, timezone=timezone, sherpa_name=api_sherpa_name,
+                    )
+                    time_strings = ts
+                    fleet_parts.append(f"**Fleet: {fl}**\n\n{resp}")
+                else:
+                    resp, _, ts = await fetch_analytics_fn(client_name, fl, time_phrase, timezone)
+                    time_strings = ts
+                    fleet_parts.append(resp)
+            except Exception as e:
+                logger.warning("Failed to fetch data for fleet %s: %s", fl, e)
+                fleet_parts.append(f"**Fleet: {fl}** — data unavailable ({e})")
+
+        combined = "\n\n---\n\n".join(fleet_parts)
+        header = _fmt_time_header(time_strings, client_name, "all fleets")
+        _save_pending_report(
+            client_name, ", ".join(fleets_to_query), time_phrase, timezone,
+            time_strings, combined, original_text, sections=None,
+        )
+        return header + combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
+
+    # ── Single fleet (normal path) ────────────────────────────────────
+    fleet_name = fleets_to_query[0]
+
+    # ── Multi-metric: call each endpoint and combine ──────────────────
+    if pq.intent == "multi_metric" and len(pq.items) > 1:
+        parts, time_strings = [], {}
+        for metric in pq.items:
+            metric_response, _, ts = await get_metric_data_fn(
+                metric=metric,
                 client_name=client_name,
                 fleet_name=fleet_name,
                 time_range=time_phrase,
                 timezone=timezone,
                 sherpa_name=api_sherpa_name,
             )
-            _save_pending_report(
-                client_name, fleet_name, time_phrase, timezone,
-                time_strings, metric_response, clean_text,
-                sections=_item_to_section_names(pq.item),
-            )
-            return metric_response + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
+            parts.append(metric_response)
+            time_strings = ts
+        combined = "\n\n".join(parts)
+        header = _fmt_time_header(time_strings, client_name, fleet_name)
+        _save_pending_report(
+            client_name, fleet_name, time_phrase, timezone,
+            time_strings, combined, original_text, sections=None,
+        )
+        return header + combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
 
-        # ── Full analytics summary ────────────────────────────────────────
-        else:
-            summary_text, data, time_strings = await fetch_analytics_fn(
-                client_name, fleet_name, time_phrase, timezone
-            )
-            _save_pending_report(
-                client_name, fleet_name, time_phrase, timezone,
-                time_strings, summary_text, clean_text,
-                sections=None,
-            )
-            return summary_text + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
+    # ── Single metric ─────────────────────────────────────────────────
+    if pq.intent == "basic_analytics_item" and pq.item:
+        metric_response, data, time_strings = await get_metric_data_fn(
+            metric=pq.item,
+            client_name=client_name,
+            fleet_name=fleet_name,
+            time_range=time_phrase,
+            timezone=timezone,
+            sherpa_name=api_sherpa_name,
+        )
+        header = _fmt_time_header(time_strings, client_name, fleet_name)
+        _save_pending_report(
+            client_name, fleet_name, time_phrase, timezone,
+            time_strings, metric_response, original_text,
+            sections=_item_to_section_names(pq.item),
+        )
+        return header + metric_response + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
 
-    except Exception as e:
-        logger.error("Error in sanjaya_chat: %s", e)
-        return f"Error: {str(e)}"
+    # ── Full analytics summary ────────────────────────────────────────
+    else:
+        summary_text, data, time_strings = await fetch_analytics_fn(
+            client_name, fleet_name, time_phrase, timezone
+        )
+        header = _fmt_time_header(time_strings, client_name, fleet_name)
+        _save_pending_report(
+            client_name, fleet_name, time_phrase, timezone,
+            time_strings, summary_text, original_text,
+            sections=None,
+        )
+        return header + summary_text + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."

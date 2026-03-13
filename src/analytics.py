@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.time_parse import parse_time_range
 from src.formatting import summarize_basic_analytics, extract_item_value
 from src.report_builder import build_pdf_from_text, send_report_email
+from src.client_match import resolve_client, resolve_sherpa
 
 logger = logging.getLogger("fm_mcp")
 
@@ -33,6 +34,8 @@ _SHERPA_LIST_VALUE_KEY: Dict[str, tuple] = {
     "utilization":             ("utilization",             "%"),
     "battery":                 ("battery_level",           "%"),
     "battery_level":           ("battery_level",           "%"),
+    "sherpa_wise_trips":       ("trip_count",              ""),
+    "sherpa_wise_distance":    ("distance_km",             " km"),
 }
 
 _METRIC_DISPLAY_LABEL: Dict[str, str] = {
@@ -45,6 +48,8 @@ _METRIC_DISPLAY_LABEL: Dict[str, str] = {
     "total_distance_km":       "Total Distance (km)",
     "battery":                 "Battery Level",
     "battery_level":           "Battery Level",
+    "sherpa_wise_trips":       "Trips per Sherpa",
+    "sherpa_wise_distance":    "Distance per Sherpa (km)",
 }
 
 
@@ -113,18 +118,11 @@ async def resolve_sherpa_names_for_fleet(
 ) -> Optional[List[str]]:
     """Resolve client + fleet to a list of sherpa names. Returns None if unresolved."""
     all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
-    client_id = None
-    for c in all_clients:
-        if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == client_name.lower():
-            client_id = c.get("fm_client_id")
-            break
-    if not client_id:
-        for c in all_clients:
-            if isinstance(c, dict):
-                c_name = (c.get("fm_client_name") or "").lower()
-                if client_name.lower() in c_name or c_name in client_name.lower():
-                    client_id = c.get("fm_client_id")
-                    break
+    matched = resolve_client(client_name, all_clients)
+    if not matched:
+        logger.warning("resolve_sherpa_names_for_fleet: no client match for '%s'", client_name)
+        return None
+    client_id = matched.get("fm_client_id")
     if not client_id:
         return None
     cache_key = f"sherpas_client_{client_id}"
@@ -183,7 +181,7 @@ async def get_metric_response_and_data(
     client_cache,
     sherpa_cache,
     sherpa_name: Optional[str] = None,
-    use_markdown: bool = False,
+    use_markdown: bool = True,
 ) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """Fetch a specific metric and return (response_text, data, time_strings)."""
     await api.ensure_token()
@@ -194,22 +192,35 @@ async def get_metric_response_and_data(
     if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
         api_sherpa_name = None
 
+    # ── Sherpa hint provided — resolve to exact API name ─────────────────────
+    if isinstance(api_sherpa_name, str) and api_sherpa_name:
+        try:
+            all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
+            matched_client = resolve_client(client_name, all_clients)
+            if matched_client:
+                client_id = matched_client.get("fm_client_id")
+                cache_key = f"sherpas_client_{client_id}"
+                all_sherpas = await sherpa_cache.get_or_set(
+                    cache_key, api.get_sherpas_by_client_id, client_id
+                )
+                fleet_sherpas = [
+                    s for s in all_sherpas
+                    if isinstance(s, dict) and (s.get("fleet_name") or "").lower() == fleet_name.lower()
+                ]
+                resolved = resolve_sherpa(api_sherpa_name, fleet_sherpas)
+                if resolved:
+                    logger.info("Resolved sherpa hint '%s' → '%s'", api_sherpa_name, resolved)
+                    api_sherpa_name = [resolved]
+                else:
+                    logger.warning("Could not resolve sherpa hint '%s' for fleet %s", api_sherpa_name, fleet_name)
+        except Exception as e:
+            logger.warning("Sherpa hint resolution failed: %s", e)
+
     if api_sherpa_name is None:
         try:
             all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
-            client_id = None
-            client_name_lower = client_name.lower()
-            for c in all_clients:
-                if isinstance(c, dict) and (c.get("fm_client_name") or "").lower() == client_name_lower:
-                    client_id = c.get("fm_client_id")
-                    break
-            if not client_id:
-                for c in all_clients:
-                    if isinstance(c, dict):
-                        c_name = (c.get("fm_client_name") or "").lower()
-                        if client_name_lower in c_name or c_name in client_name_lower:
-                            client_id = c.get("fm_client_id")
-                            break
+            matched = resolve_client(client_name, all_clients)
+            client_id = matched.get("fm_client_id") if matched else None
             if client_id:
                 cache_key = f"sherpas_client_{client_id}"
                 all_sherpas = await sherpa_cache.get_or_set(

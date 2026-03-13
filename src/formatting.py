@@ -34,61 +34,87 @@ def _find_sherpa_entry(
     return None
 
 
+def _md_table(headers: List[str], rows: List[List[str]]) -> str:
+    """Build a GitHub-flavoured markdown table."""
+    sep = ["-" * max(len(h), 3) for h in headers]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(sep) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+
 def summarize_basic_analytics(payload: Dict[str, Any]) -> str:
-    # Use inner payload if API returns { "data": { ... } }
+    """Return a Markdown-formatted analytics summary."""
     if isinstance(payload.get("data"), dict):
         payload = payload["data"]
-    total_trips = payload.get("total_trips")
+
+    sections: List[str] = []
+
+    # ── Headline numbers ──────────────────────────────────────────────────────
+    total_trips    = payload.get("total_trips")
     total_distance = payload.get("total_distance_km")
+    headline_rows  = []
+    if total_trips    is not None: headline_rows.append(["Total Trips",       str(total_trips)])
+    if total_distance is not None: headline_rows.append(["Total Distance (km)", str(total_distance)])
+    if headline_rows:
+        sections.append(_md_table(["Metric", "Value"], headline_rows))
 
-    lines: List[str] = []
-    lines.append(f"Total trips: {total_trips}")
-    lines.append(f"Total distance (km): {total_distance}")
-
-    # Top trips
+    # ── Trips by Sherpa ───────────────────────────────────────────────────────
     st = payload.get("sherpa_wise_trips") or []
     if st:
-        top = sorted(st, key=lambda x: x.get("trip_count", 0), reverse=True)[:5]
-        lines.append("\nTrips by Sherpa (top 5):")
-        for r in top:
-            lines.append(f"- {r.get('sherpa_name')}: {r.get('trip_count')}")
+        top = sorted(st, key=lambda x: x.get("trip_count", 0), reverse=True)[:10]
+        rows = [[r.get("sherpa_name", "?"), str(r.get("trip_count", 0))] for r in top]
+        sections.append("**Trips by Sherpa** (top 10)\n" + _md_table(["Sherpa", "Trips"], rows))
 
-    # Availability (per sherpa)
+    # ── Availability ──────────────────────────────────────────────────────────
     av = payload.get("availability") or []
     if av:
-        lines.append("\nAvailability:")
-        for r in av:
-            val = r.get("availability_percentage") or r.get("availability", "")
-            lines.append(f"- {r.get('sherpa_name')}: {val}")
+        rows = [
+            [r.get("sherpa_name", "?"),
+             f"{r.get('availability_percentage') or r.get('availability', 0):.1f}%"]
+            for r in av
+        ]
+        sections.append("**Availability**\n" + _md_table(["Sherpa", "Availability"], rows))
 
-    # Utilization (per sherpa)
+    # ── Utilization ───────────────────────────────────────────────────────────
     util = payload.get("utilization") or []
     if util:
-        lines.append("\nUtilization:")
-        for r in util:
-            lines.append(f"- {r.get('sherpa_name')}: {r.get('utilization')}")
+        rows = [
+            [r.get("sherpa_name", "?"), f"{r.get('utilization', 0):.1f}%"]
+            for r in util
+        ]
+        sections.append("**Utilization**\n" + _md_table(["Sherpa", "Utilization"], rows))
 
-    # Sherpa-wise distance
+    # ── Sherpa-wise distance ──────────────────────────────────────────────────
     swd = payload.get("sherpa_wise_distance") or []
     if swd:
-        lines.append("\nSherpa-wise distance:")
+        rows = []
         for r in swd:
             dist = r.get("distance_km") or r.get("total_distance_km") or r.get("distance", 0)
-            lines.append(f"- {r.get('sherpa_name')}: {dist}")
+            rows.append([r.get("sherpa_name", "?"), f"{dist:.2f}" if isinstance(dist, float) else str(dist)])
+        sections.append("**Distance by Sherpa (km)**\n" + _md_table(["Sherpa", "Distance (km)"], rows))
 
-    # Takt time per sherpa
+    # ── Avg Takt Time per Sherpa ──────────────────────────────────────────────
     takt = payload.get("avg_takt_per_sherpa") or []
     if takt:
-        lines.append("\nAverage Takt Time per Sherpa (minutes):")
+        rows = []
         for r in sorted(takt, key=lambda x: x.get("avg_takt_time_minutes", 0), reverse=True)[:10]:
-            sherpa = r.get("sherpa", "Unknown")
-            avg_takt = r.get("avg_takt_time_minutes", 0)
-            min_takt = r.get("min_takt_time_minutes", 0)
-            max_takt = r.get("max_takt_time_minutes", 0)
-            trips = r.get("total_trips", 0)
-            lines.append(f"- {sherpa}: avg={avg_takt:.2f} min (min={min_takt:.2f}, max={max_takt:.2f}), trips={trips}")
+            rows.append([
+                r.get("sherpa", "?"),
+                f"{r.get('avg_takt_time_minutes', 0):.2f}",
+                f"{r.get('min_takt_time_minutes', 0):.2f}",
+                f"{r.get('max_takt_time_minutes', 0):.2f}",
+                str(r.get("total_trips", 0)),
+            ])
+        sections.append(
+            "**Avg Takt Time per Sherpa (min)**\n"
+            + _md_table(["Sherpa", "Avg", "Min", "Max", "Trips"], rows)
+        )
 
-    return "\n".join(lines)
+    return "\n\n".join(sections) if sections else "No data available."
 
 
 def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional[str] = None) -> Tuple[Any, str]:
@@ -138,15 +164,10 @@ def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional
                     note = f"Matched '{sherpa_hint}' to '{e.get('sherpa_name')}'."
                 return e.get("trip_count") or e.get("total_trips") or e.get("trips"), note
             return 0, f"No matching Sherpa found in sherpa_wise_trips list."
-        # No sherpa hint - return all sherpas as comma-separated values
+        # No sherpa hint — return list of dicts so format_metric_value can render a table
         entries = payload.get("sherpa_wise_trips") or []
         if entries:
-            sherpa_values = []
-            for entry in entries:
-                sherpa_name = entry.get("sherpa_name", "Unknown")
-                trip_count = entry.get("trip_count") or entry.get("total_trips") or entry.get("trips", 0)
-                sherpa_values.append(f"{sherpa_name}: {trip_count}")
-            return ", ".join(sherpa_values), "All sherpas"
+            return entries, "All sherpas"
         # Fallback to total if sherpa_wise_trips not available
         return payload.get("total_trips"), note
 
