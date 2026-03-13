@@ -15,6 +15,12 @@ import sys
 from datetime import date, timedelta
 from typing import Optional
 
+try:
+    import pandas as pd
+    _PANDAS_OK = True
+except ImportError:
+    _PANDAS_OK = False
+
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -27,19 +33,12 @@ import streamlit as st
 
 from src.logging_config import setup_logging
 from src.nlu import parse_query
-from src.sanjaya_client import SanjayaAPI
-from src.cache import TTLCache
-from src.chat_handler import handle_chat
-from src.analytics import (
-    fetch_analytics_data_and_summary,
-    get_metric_response_and_data,
-    generate_and_send_text_report,
-)
-from src.scheduling import _save_pending_report, _item_to_section_names
+import src.mcp_client as mcp_client
 
 setup_logging(os.environ.get("LOG_LEVEL", "WARNING"))
 
-BASE_URL = "https://sanjaya.atimotors.com"
+# MCP server URL — set MCP_SERVER_URL in .env (or docker-compose environment)
+_MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8000/sse")
 
 # "__custom__" is a sentinel for the custom date picker
 TIME_OPTIONS: dict[str, str] = {
@@ -70,20 +69,6 @@ SCHEDULE_OPTIONS = [
     ("Skip",            "skip"),
 ]
 
-# Ordered longest-first so "sherpa status" matches before "status"
-_METRIC_PATTERNS: list[tuple[str, str]] = [
-    (r"\bsherpa[\s_]?status\b",    "sherpa_status"),
-    (r"\broute[\s_]?utilization\b", "route_utilization"),
-    (r"\bobstacle[\s_]?time\b",    "obstacle_time"),
-    (r"\btakt(?:[\s_]?time)?\b",   "takt_time"),
-    (r"\btotal[\s_]?trips\b|\btrips\b",    "total_trips"),
-    (r"\btotal[\s_]?distance\b|\bdistance\b", "total_distance_km"),
-    (r"\bavailability\b",          "availability"),
-    (r"\butilization\b",           "utilization"),
-    (r"\bactivity\b",              "activity"),
-    (r"\buptime\b",                "uptime"),
-]
-
 _CONTROL_CMDS = {
     "proceed", "yes", "confirm", "send", "proceed to email",
     "cancel", "no", "skip",
@@ -102,10 +87,7 @@ def _run(coro):
 
 def _init_session() -> None:
     defaults: dict = {
-        "api":                  SanjayaAPI(BASE_URL),
-        "client_cache":         TTLCache(ttl_seconds=600.0, max_size=100),
-        "client_details_cache": TTLCache(ttl_seconds=600.0, max_size=100),
-        "sherpa_cache":         TTLCache(ttl_seconds=300.0, max_size=200),
+        "mcp_url":              _MCP_SERVER_URL,
         "messages":             [],
         "clients_list":         [],
         "fleet_map":            {},
@@ -127,71 +109,20 @@ def _init_session() -> None:
 # ── API helpers ───────────────────────────────────────────────────────────────
 
 def _load_clients() -> list[str]:
-    api   = st.session_state.api
-    cache = st.session_state.client_cache
-
-    async def _f():
-        await api.ensure_token()
-        clients = await cache.get_or_set("all_clients", api.get_clients)
-        return sorted(
-            c.get("fm_client_name") for c in clients
-            if isinstance(c, dict) and c.get("fm_client_name")
-        )
-    return _run(_f())
+    url = st.session_state.mcp_url
+    return _run(mcp_client.list_clients(server_url=url))
 
 
 def _load_fleets(client_name: str) -> list[str]:
-    api = st.session_state.api
-    cc  = st.session_state.client_cache
-    dc  = st.session_state.client_details_cache
-
-    async def _f():
-        await api.ensure_token()
-        all_clients = await cc.get_or_set("all_clients", api.get_clients)
-        client_id = next(
-            (c.get("fm_client_id") for c in all_clients
-             if isinstance(c, dict)
-             and (c.get("fm_client_name") or "").lower() == client_name.lower()),
-            None,
-        )
-        if not client_id:
-            return []
-        details = await dc.get_or_set(
-            f"client_details_{client_id}", api.get_client_by_id, client_id
-        )
-        return sorted(details.get("fm_fleet_names", []))
-    return _run(_f())
+    url = st.session_state.mcp_url
+    return _run(mcp_client.list_fleets(client_name, server_url=url))
 
 
 def _load_sherpas(client_name: str, fleet_names: list[str]) -> list[str]:
     if not fleet_names:
         return []
-    api = st.session_state.api
-    cc  = st.session_state.client_cache
-    sc  = st.session_state.sherpa_cache
-
-    async def _f():
-        await api.ensure_token()
-        all_clients = await cc.get_or_set("all_clients", api.get_clients)
-        client_id = next(
-            (c.get("fm_client_id") for c in all_clients
-             if isinstance(c, dict)
-             and (c.get("fm_client_name") or "").lower() == client_name.lower()),
-            None,
-        )
-        if not client_id:
-            return []
-        all_sherpas = await sc.get_or_set(
-            f"sherpas_client_{client_id}", api.get_sherpas_by_client_id, client_id
-        )
-        fleet_lower = {f.lower() for f in fleet_names}
-        return sorted(set(
-            s.get("sherpa_name") for s in all_sherpas
-            if isinstance(s, dict)
-            and (s.get("fleet_name") or "").lower() in fleet_lower
-            and s.get("sherpa_name")
-        ))
-    return _run(_f())
+    url = st.session_state.mcp_url
+    return _run(mcp_client.list_sherpas(client_name, fleet_names, server_url=url))
 
 
 # ── NLU parse for confirmation ────────────────────────────────────────────────
@@ -249,53 +180,6 @@ def _parse_for_confirmation(
     }
 
 
-# ── Multi-metric detection ────────────────────────────────────────────────────
-
-def _detect_metrics(text: str) -> list[str]:
-    t = text.lower()
-    found, seen = [], set()
-    for pattern, metric in _METRIC_PATTERNS:
-        if re.search(pattern, t) and metric not in seen:
-            found.append(metric)
-            seen.add(metric)
-    return found if len(found) >= 2 else []
-
-
-# ── Helper factories (called in Streamlit thread, closures carry captured objects) ──
-
-def _make_fetch_fn(api, cc, sc):
-    async def _fn(cn, fn, tr, tz):
-        return await fetch_analytics_data_and_summary(
-            cn, fn, tr, tz, api=api, client_cache=cc, sherpa_cache=sc,
-        )
-    return _fn
-
-
-def _make_metric_fn(api, cc, sc):
-    # Parameter names must match the keyword args handle_chat uses when calling get_metric_data_fn:
-    # get_metric_data_fn(metric=..., client_name=..., fleet_name=..., time_range=..., timezone=..., sherpa_name=...)
-    async def _fn(metric, client_name, fleet_name, time_range, timezone, sherpa_name=None):
-        return await get_metric_response_and_data(
-            metric, client_name, fleet_name, time_range, timezone,
-            api=api, client_cache=cc, sherpa_cache=sc,
-            sherpa_name=sherpa_name, use_markdown=True,
-        )
-    return _fn
-
-
-def _make_send_fn(recipient: Optional[str] = None):
-    def _fn(report_text, cn, fn, tr, tz, ts):
-        old = os.environ.get("REPORT_RECIPIENT", "")
-        try:
-            if recipient:
-                os.environ["REPORT_RECIPIENT"] = recipient
-            generate_and_send_text_report(
-                report_text, cn, fn, tr, tz, ts, project_root=_PROJECT_ROOT,
-            )
-        finally:
-            os.environ["REPORT_RECIPIENT"] = old
-    return _fn
-
 
 # ── Chat state detection ──────────────────────────────────────────────────────
 
@@ -313,239 +197,58 @@ def _get_chat_state() -> str:
     return "idle"
 
 
-# ── Multi-fleet and multi-metric async handlers ───────────────────────────────
-
-async def _run_multi_fleet_query(
-    prompt: str, client_name: str, fleet_names: list[str],
-    time_phrase: str, timezone: str, sherpa_hint: Optional[str],
-    *, api, client_cache, sherpa_cache,
-) -> str:
-    """Run any query (summary, single metric, or multi-metric) across multiple fleets."""
-    from src.nlu import parse_query as _parse_query
-
-    nlu_defaults = {
-        "fm_client_name": "", "fleet_name": "",
-        "timezone": timezone, "time_phrase": time_phrase,
-    }
-    try:
-        pq = await _parse_query(prompt, defaults=nlu_defaults)
-    except Exception:
-        pq = None
-
-    fleet_parts, all_texts, time_strings = [], [], {}
-
-    for fleet in fleet_names:
-        if pq and pq.intent == "multi_metric" and len(pq.items) > 1:
-            metric_parts = []
-            for metric in pq.items:
-                text, _, ts = await get_metric_response_and_data(
-                    metric, client_name, fleet, time_phrase, timezone,
-                    api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-                    sherpa_name=sherpa_hint, use_markdown=True,
-                )
-                metric_parts.append(text)
-                time_strings = ts
-            fleet_text = "\n\n".join(metric_parts)
-        elif pq and pq.intent == "basic_analytics_item" and pq.item:
-            fleet_text, _, time_strings = await get_metric_response_and_data(
-                pq.item, client_name, fleet, time_phrase, timezone,
-                api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-                sherpa_name=sherpa_hint, use_markdown=True,
-            )
-        else:
-            fleet_text, _, time_strings = await fetch_analytics_data_and_summary(
-                client_name, fleet, time_phrase, timezone,
-                api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-            )
-
-        fleet_parts.append(f"### Fleet: {fleet}\n\n{fleet_text}")
-        all_texts.append(fleet_text)
-
-    combined = "\n\n---\n\n".join(fleet_parts)
-    _save_pending_report(
-        client_name, ", ".join(fleet_names), time_phrase, timezone,
-        time_strings, "\n\n---\n\n".join(all_texts),
-        prompt, sections=None,
-    )
-    return combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
-
-
-async def _run_multi_metric(
-    metrics: list[str], client_name: str, fleet_name: str,
-    time_phrase: str, timezone: str, sherpa_hint: Optional[str],
-    *, api, client_cache, sherpa_cache,
-) -> str:
-    parts, time_strings = [], {}
-    for metric in metrics:
-        text, _, ts = await get_metric_response_and_data(
-            metric, client_name, fleet_name, time_phrase, timezone,
-            api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-            sherpa_name=sherpa_hint, use_markdown=True,
-        )
-        parts.append(text)
-        time_strings = ts
-    combined = "\n\n".join(parts)
-    _save_pending_report(
-        client_name, fleet_name, time_phrase, timezone,
-        time_strings, combined,
-        f"metrics: {', '.join(metrics)}", sections=None,
-    )
-    return combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
-
-
-# ── Execute a user-confirmed query directly (no NLU re-parse) ─────────────────
-
-async def _execute_confirmed(
-    client_name: str, fleet_name: str, time_phrase: str, timezone: str,
-    intent: str, item: Optional[str], sherpa_hint: Optional[str],
-    fleet_names: list[str], sherpa_names: list[str],
-    *, api, client_cache, sherpa_cache,
-) -> str:
-    """Run analytics with the parameters the user approved in the confirmation card."""
-
-    # Multi-fleet basic analytics
-    if not item and len(fleet_names) > 1:
-        return await _run_multi_fleet(
-            client_name, fleet_names, time_phrase, timezone,
-            api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-        )
-
-    sherpa_arg = sherpa_hint or (sherpa_names[0] if len(sherpa_names) == 1 else None)
-
-    # Specific metric
-    if intent == "basic_analytics_item" and item:
-        text, _, ts = await get_metric_response_and_data(
-            item, client_name, fleet_name, time_phrase, timezone,
-            api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-            sherpa_name=sherpa_arg, use_markdown=True,
-        )
-        _save_pending_report(
-            client_name, fleet_name, time_phrase, timezone,
-            ts, text, f"{item} query",
-            sections=_item_to_section_names(item),
-        )
-        return text + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
-
-    # Basic analytics (single fleet)
-    text, _, ts = await fetch_analytics_data_and_summary(
-        client_name, fleet_name, time_phrase, timezone,
-        api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-    )
-    _save_pending_report(
-        client_name, fleet_name, time_phrase, timezone,
-        ts, text, "basic analytics", sections=None,
-    )
-    return text + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
-
 
 # ── Main message processor ────────────────────────────────────────────────────
 
 def _process_message(
     prompt: str,
-    client_name: str,
-    fleet_names: list[str],
-    sherpa_names: list[str],
-    time_phrase: str,
+    client_name: str       = "",   # reserved for dropdown-backup mode
+    fleet_names: list[str] = None, # reserved for dropdown-backup mode
+    sherpa_names: list[str]= None, # reserved for dropdown-backup mode
+    time_phrase: str       = "",   # reserved for dropdown-backup mode
     recipient_email: Optional[str] = None,
 ) -> str:
-    api = st.session_state.api
-    cc  = st.session_state.client_cache
-    dcc = st.session_state.client_details_cache
-    sc  = st.session_state.sherpa_cache
-    timezone      = os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata")
-    primary_fleet = fleet_names[0] if fleet_names else ""
+    """Send any message (analytics query, proceed, cancel, schedule) to the MCP server.
 
-    defaults = {
-        "fm_client_name": client_name,
-        "fleet_name":     primary_fleet,
-        "fleet_id":       None,
-        "timezone":       timezone,
-        "time_phrase":    time_phrase,
-    }
-
-    cmd        = prompt.strip().lower()
-    is_control = cmd in _CONTROL_CMDS
-    is_sched   = not is_control and any(
-        kw in cmd for kw in ("daily", "hourly", "weekly", "every 20", "every hour")
-    )
-
-    if is_control or is_sched:
-        return _run(handle_chat(
-            prompt,
-            api=api, client_cache=cc, client_details_cache=dcc, sherpa_cache=sc,
-            project_root=_PROJECT_ROOT,
-            defaults=defaults,
-            get_metric_data_fn=_make_metric_fn(api, cc, sc),
-            fetch_analytics_fn=_make_fetch_fn(api, cc, sc),
-            send_text_report_fn=_make_send_fn(recipient_email),
-        ))
-
-    sherpa_hint: Optional[str] = sherpa_names[0] if len(sherpa_names) == 1 else None
-
-    # Multi-fleet: handle_chat can only query one fleet at a time, so we fan out here
-    if len(fleet_names) > 1:
-        return _run(_run_multi_fleet_query(
-            prompt, client_name, fleet_names, time_phrase, timezone, sherpa_hint,
-            api=api, client_cache=cc, sherpa_cache=sc,
-        ))
-
-    # Inject single sherpa into query text (NLU picks it up)
-    modified = prompt
-    if sherpa_hint and not re.search(r"\bsherpa\b|\btug\b", prompt.lower()):
-        modified = f"{prompt} for {sherpa_hint}"
-
-    return _run(handle_chat(
-        modified,
-        api=api, client_cache=cc, client_details_cache=dcc, sherpa_cache=sc,
-        project_root=_PROJECT_ROOT,
-        defaults=defaults,
-        get_metric_data_fn=_make_metric_fn(api, cc, sc),
-        fetch_analytics_fn=_make_fetch_fn(api, cc, sc),
-        send_text_report_fn=_make_send_fn(),
+    Prompt-first mode: client/fleet/time are extracted by NLU on the server side.
+    The sidebar params (client_name, fleet_names, time_phrase) are accepted but NOT
+    forwarded — re-enable the commented lines below to use them as fallbacks.
+    """
+    url      = st.session_state.mcp_url
+    timezone = os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata")
+    return _run(mcp_client.chat(
+        prompt,
+        # Dropdown-backup (disabled): uncomment to pass sidebar context as defaults
+        # client_name=client_name,
+        # fleet_name=fleet_names[0] if fleet_names else "",
+        # fleet_names=fleet_names if fleet_names and len(fleet_names) > 1 else None,
+        # time_phrase=time_phrase,
+        timezone=timezone,
+        recipient_email=recipient_email or None,
+        server_url=url,
     ))
 
 
 def _process_confirmed(data: dict) -> str:
-    """Execute analytics with the user-approved parameters from the confirmation card."""
-    api = st.session_state.api
-    cc  = st.session_state.client_cache
-    sc  = st.session_state.sherpa_cache
+    """Execute analytics with the user-approved text from the confirmation card.
 
-    # The text the user saw / edited in the confirmation card
-    prompt_text  = data.get("edited_prompt") or data.get("original_prompt", "")
-    client_name  = data["client_name"]
-    fleet_name   = data.get("fleet_name", "")
-    fleet_names  = data.get("fleet_names", [fleet_name])
-    sherpa_names = data.get("sherpa_names", [])
-    time_phrase  = data["time_phrase"]
-    timezone     = data["timezone"]
-    sherpa_hint  = data.get("sherpa_hint")
-    primary_fleet = fleet_names[0] if fleet_names else fleet_name
-
-    effective_sherpa = sherpa_hint or (sherpa_names[0] if len(sherpa_names) == 1 else None)
-
-    # Multi-fleet: fan out across all selected fleets
-    if len(fleet_names) > 1:
-        return _run(_run_multi_fleet_query(
-            prompt_text, client_name, fleet_names, time_phrase, timezone, effective_sherpa,
-            api=api, client_cache=cc, sherpa_cache=sc,
-        ))
-
-    # Multi-metric: use items from NLU parse (handles cross-endpoint queries like
-    # "uptime and obstacle time" which need basic_analytics + route_analytics endpoints)
-    items = data.get("items") or []
-    if len(items) > 1:
-        return _run(_run_multi_metric(
-            items, client_name, primary_fleet, time_phrase, timezone, effective_sherpa,
-            api=api, client_cache=cc, sherpa_cache=sc,
-        ))
-
-    # Single metric or basic analytics
-    return _run(_execute_confirmed(
-        client_name, fleet_name, time_phrase, timezone,
-        data["intent"], data.get("item"), sherpa_hint,
-        fleet_names, sherpa_names,
-        api=api, client_cache=cc, sherpa_cache=sc,
+    Prompt-first mode: the edited prompt text is sent as-is; the MCP server re-runs
+    NLU to extract client, fleet, time, and metrics.  The NLU-resolved values from
+    the confirmation card (data["client_name"] etc.) are available here if you want
+    to re-enable sidebar fallback — see commented lines below.
+    """
+    url         = st.session_state.mcp_url
+    prompt_text = data.get("edited_prompt") or data.get("original_prompt", "")
+    timezone    = data.get("timezone", os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata"))
+    return _run(mcp_client.chat(
+        prompt_text,
+        # Dropdown-backup (disabled): uncomment to pass resolved context as defaults
+        # client_name=data.get("client_name", ""),
+        # fleet_name=(data.get("fleet_names") or [data.get("fleet_name", "")])[0],
+        # fleet_names=data.get("fleet_names") if len(data.get("fleet_names") or []) > 1 else None,
+        # time_phrase=data.get("time_phrase", ""),
+        timezone=timezone,
+        server_url=url,
     ))
 
 
@@ -599,6 +302,84 @@ def _handle_pending_actions() -> None:
     st.session_state.messages.append({"role": "assistant", "content": response})
 
 
+# ── Assistant message renderer ────────────────────────────────────────────────
+
+def _render_assistant_message(content: str) -> None:
+    """Render an assistant message using rich Streamlit components.
+
+    Segments:
+    - Line containing 📅  → st.info() (time/context header)
+    - "---" separators   → st.divider()
+    - Markdown tables    → st.dataframe() (pandas required, else st.markdown())
+    - Proceed/cancel     → st.caption()
+    - Everything else    → st.markdown() (flushed in chunks)
+    """
+    lines = content.split("\n")
+    buffer: list[str] = []
+
+    def _flush() -> None:
+        if buffer:
+            txt = "\n".join(buffer).strip()
+            if txt:
+                st.markdown(txt)
+            buffer.clear()
+
+    def _parse_md_row(row: str) -> list[str]:
+        return [c.strip() for c in row.strip().strip("|").split("|")]
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # ── Time / context header (contains 📅) ───────────────────────────────
+        if "📅" in line:
+            _flush()
+            clean = re.sub(r"\*\*|&nbsp;", "", line).strip().strip("|").strip()
+            st.info(clean)
+            i += 1
+            continue
+
+        # ── Horizontal rule ───────────────────────────────────────────────────
+        if line.strip() == "---":
+            _flush()
+            st.divider()
+            i += 1
+            continue
+
+        # ── Markdown table ────────────────────────────────────────────────────
+        if line.strip().startswith("|"):
+            _flush()
+            table_lines: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i])
+                i += 1
+            # Need at least: header row + separator row + 1 data row
+            if _PANDAS_OK and len(table_lines) >= 3:
+                try:
+                    headers = _parse_md_row(table_lines[0])
+                    data_rows = [_parse_md_row(r) for r in table_lines[2:]]
+                    df = pd.DataFrame(data_rows, columns=headers)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    continue
+                except Exception:
+                    pass
+            # Fallback: plain markdown
+            st.markdown("\n".join(table_lines))
+            continue
+
+        # ── Proceed / cancel footer ───────────────────────────────────────────
+        if "type **proceed**" in line.lower() or "type proceed" in line.lower():
+            _flush()
+            st.caption(re.sub(r"\*\*", "", line).strip())
+            i += 1
+            continue
+
+        buffer.append(line)
+        i += 1
+
+    _flush()
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 def _render_sidebar() -> tuple[str, list[str], list[str], str]:
@@ -606,63 +387,71 @@ def _render_sidebar() -> tuple[str, list[str], list[str], str]:
         st.markdown("## 📊 Sanjaya Analytics")
         st.divider()
 
-        if not st.session_state.clients_list:
-            with st.spinner("Loading clients…"):
-                try:
-                    st.session_state.clients_list = _load_clients()
-                except Exception as e:
-                    st.error(f"Could not load clients: {e}")
+        # ── Client / Fleet / Sherpa dropdowns (disabled — prompt-first mode) ────
+        # Dropdowns are kept in code as backup. Re-enable by uncommenting below
+        # and removing the empty defaults. When re-enabled, sidebar values become
+        # the fallback when the user's prompt contains no client/fleet info.
+        #
+        # if not st.session_state.clients_list:
+        #     with st.spinner("Loading clients…"):
+        #         try:
+        #             st.session_state.clients_list = _load_clients()
+        #         except Exception as e:
+        #             st.error(f"Could not load clients: {e}")
+        #
+        # st.subheader("Query Context")
+        #
+        # selected_client: str = st.selectbox(
+        #     "Client",
+        #     options=[""] + st.session_state.clients_list,
+        #     format_func=lambda x: "— select client —" if x == "" else x,
+        #     key="sel_client",
+        # )
+        # fleet_options: list[str] = []
+        # if selected_client:
+        #     if selected_client not in st.session_state.fleet_map:
+        #         with st.spinner("Loading fleets…"):
+        #             try:
+        #                 st.session_state.fleet_map[selected_client] = _load_fleets(selected_client)
+        #             except Exception as e:
+        #                 st.error(f"Could not load fleets: {e}")
+        #                 st.session_state.fleet_map[selected_client] = []
+        #     fleet_options = st.session_state.fleet_map.get(selected_client, [])
+        # selected_fleets: list[str] = st.multiselect(
+        #     "Fleet(s)", options=fleet_options, disabled=not selected_client,
+        #     placeholder="Select one or more fleets…", key="sel_fleets",
+        # )
+        # sherpa_options: list[str] = []
+        # if selected_client and selected_fleets:
+        #     sherpa_key = f"{selected_client}::{':'.join(sorted(selected_fleets))}"
+        #     if sherpa_key not in st.session_state.sherpa_map:
+        #         with st.spinner("Loading sherpas…"):
+        #             try:
+        #                 st.session_state.sherpa_map[sherpa_key] = _load_sherpas(
+        #                     selected_client, selected_fleets
+        #                 )
+        #             except Exception as e:
+        #                 st.error(f"Could not load sherpas: {e}")
+        #                 st.session_state.sherpa_map[sherpa_key] = []
+        #     sherpa_options = st.session_state.sherpa_map.get(sherpa_key, [])
+        # selected_sherpas: list[str] = st.multiselect(
+        #     "Sherpa(s)", options=sherpa_options, disabled=not selected_fleets,
+        #     placeholder="All sherpas (default)…", key="sel_sherpas",
+        # )
 
-        st.subheader("Query Context")
-
-        selected_client: str = st.selectbox(
-            "Client",
-            options=[""] + st.session_state.clients_list,
-            format_func=lambda x: "— select client —" if x == "" else x,
-            key="sel_client",
-        )
-
-        # Fleet multiselect
-        fleet_options: list[str] = []
-        if selected_client:
-            if selected_client not in st.session_state.fleet_map:
-                with st.spinner("Loading fleets…"):
-                    try:
-                        st.session_state.fleet_map[selected_client] = _load_fleets(selected_client)
-                    except Exception as e:
-                        st.error(f"Could not load fleets: {e}")
-                        st.session_state.fleet_map[selected_client] = []
-            fleet_options = st.session_state.fleet_map.get(selected_client, [])
-
-        selected_fleets: list[str] = st.multiselect(
-            "Fleet(s)",
-            options=fleet_options,
-            disabled=not selected_client,
-            placeholder="Select one or more fleets…",
-            key="sel_fleets",
-        )
-
-        # Sherpa multiselect
-        sherpa_options: list[str] = []
-        if selected_client and selected_fleets:
-            sherpa_key = f"{selected_client}::{':'.join(sorted(selected_fleets))}"
-            if sherpa_key not in st.session_state.sherpa_map:
-                with st.spinner("Loading sherpas…"):
-                    try:
-                        st.session_state.sherpa_map[sherpa_key] = _load_sherpas(
-                            selected_client, selected_fleets
-                        )
-                    except Exception as e:
-                        st.error(f"Could not load sherpas: {e}")
-                        st.session_state.sherpa_map[sherpa_key] = []
-            sherpa_options = st.session_state.sherpa_map.get(sherpa_key, [])
-
-        selected_sherpas: list[str] = st.multiselect(
-            "Sherpa(s)",
-            options=sherpa_options,
-            disabled=not selected_fleets,
-            placeholder="All sherpas (default)…",
-            key="sel_sherpas",
+        # Prompt-first mode: all context comes from the user's prompt via NLU
+        selected_client: str = ""
+        selected_fleets: list[str] = []
+        selected_sherpas: list[str] = []
+        st.info(
+            "💬 **Prompt-first mode**\n\n"
+            "**Format:** `client <name> [fleet <name>] <metric> <time>`\n\n"
+            "Examples:\n"
+            "- `client CEAT-Nagpur uptime yesterday`\n"
+            "- `client YOKOHAMA-DAHEJ fleet BEAD total trips last week`\n"
+            "- `client CEAT-Nagpur tug-104 obstacle time`\n\n"
+            "Fuzzy matching is on — close spellings work.\n"
+            "Omit fleet → queries all fleets."
         )
 
         # ── Time range with custom date picker ────────────────────────────────
@@ -706,19 +495,9 @@ def _render_sidebar() -> tuple[str, list[str], list[str], str]:
 
         st.divider()
 
-        # Active context summary
-        ready = bool(selected_client and selected_fleets)
-        if ready:
-            st.success(f"**{selected_client}**")
-            for f in selected_fleets:
-                st.caption(f"📍 {f}")
-            if selected_sherpas:
-                st.caption(f"🤖 {', '.join(selected_sherpas)}")
-            else:
-                st.caption("🤖 All sherpas")
-            st.caption(f"📅 {time_display}")
-        else:
-            st.info("Select a client and fleet(s) to start.")
+        # In prompt-first mode, chat is always ready
+        ready = True
+        st.caption(f"📅 {time_display}")
 
         st.divider()
 
@@ -769,30 +548,30 @@ def _build_confirmation_text(c: dict) -> str:
 
 
 def _render_confirmation_panel(confirmation: dict) -> None:
-    """Show a single editable line with what the bot understood; user can tweak and confirm."""
+    """Show what the bot understood (read-only), then the original prompt editable."""
     c = confirmation
     summary = _build_confirmation_text(c)
+    original = c.get("original_prompt", summary)
 
     with st.container(border=True):
-        st.markdown(
-            "**🔍 Here's what I understood — edit the text below if needed, then run:**"
-        )
+        st.markdown("**🔍 What I understood:**")
+        st.caption(f"`{summary}`")
+        st.markdown("**Your query — edit if needed, then run:**")
         edited = st.text_area(
-            label="Query summary",
-            value=summary,
+            label="Query",
+            value=original,
             height=70,
             key="conf_text",
             help=(
-                "You can freely edit this. "
-                "Examples: change the client name, fleet, time period, or metrics. "
-                "Separate multiple metrics with 'and'."
+                "This is your original message. Edit it if something was misunderstood. "
+                "Tip: prefix the client name with 'client' for best accuracy — "
+                "e.g. 'client YOKOHAMA-DAHEJ uptime yesterday'."
             ),
             label_visibility="collapsed",
         )
         st.caption(
-            "💡 Tip: you can write anything — "
-            "e.g. *uptime and obstacle time for last 7 days*, "
-            "*total trips for FLEET-X for 01 Jan 2026 to 07 Jan 2026*"
+            "💡 **Tip:** Use `client <name>` for reliable client detection — "
+            "e.g. *client CEAT-Nagpur uptime and obstacle time for last 7 days*"
         )
 
         btn1, btn2 = st.columns(2)
@@ -843,12 +622,47 @@ def main():
     st.session_state._ctx_sherpas = selected_sherpas
     st.session_state._ctx_time    = time_phrase
 
-    ready = bool(selected_client and selected_fleets)
+    ready = True  # prompt-first mode: chat is always ready (dropdowns disabled)
 
     # ── Chat area ─────────────────────────────────────────────────────────────
     st.markdown("# Sanjaya Analytics Chat")
 
     if not st.session_state.messages and not st.session_state.pending_confirmation:
+        # ── Onboarding / format guide ──────────────────────────────────────
+        with st.container(border=True):
+            st.markdown("### 👋 Welcome to Sanjaya Analytics")
+            st.markdown(
+                "Type your query in plain English. Here's how to get the best results:"
+            )
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown(
+                    "**Client name** — always prefix with `client`:\n"
+                    "```\nclient YOKOHAMA-DAHEJ uptime yesterday\n"
+                    "client CEAT-Nagpur total trips last week\n```\n"
+                    "Fuzzy matching is active — partial or approximate names work,\n"
+                    "but exact spelling avoids ambiguity.\n\n"
+                    "**Fleet name** — prefix with `fleet` (optional):\n"
+                    "```\nclient CEAT-Nagpur fleet BEAD uptime\n```\n"
+                    "Omit the fleet to query **all fleets** for that client.\n\n"
+                    "**Sherpa / Tug** — use the tug ID (e.g. `tug-104`):\n"
+                    "```\nclient CEAT-Nagpur tug-104 uptime yesterday\n```\n"
+                    "Use `per sherpa` to get values for **every** sherpa."
+                )
+            with col_b:
+                st.markdown(
+                    "**Time period** — plain English:\n"
+                    "```\nyesterday  |  today  |  last week\n"
+                    "last 7 days  |  this month\n"
+                    "1 Jan 2026 to 10 Jan 2026\n```\n\n"
+                    "**Multiple metrics** — comma or 'and':\n"
+                    "```\nclient CEAT-Nagpur uptime and obstacle time last week\n```\n\n"
+                    "**Report + schedule** — after any result:\n"
+                    "- Type `proceed` → email the PDF\n"
+                    "- Then choose: `daily 8` / `weekly monday 9` / `skip`"
+                )
+        st.divider()
+
         if ready:
             st.markdown("**Quick queries — click to run instantly:**")
             cols = st.columns(4)
@@ -858,17 +672,14 @@ def main():
                         st.session_state.pending_action = ("quick_query", query)
                         st.rerun()
             st.divider()
-        else:
-            st.info(
-                "👋 **Welcome!** Select a **Client** and **Fleet(s)** from the sidebar, "
-                "then tap a quick query or type below.\n\n"
-                "**Examples:** `basic analytics` · `total trips` · `uptime and obstacle time`"
-            )
 
     # Render chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            if msg["role"] == "assistant":
+                _render_assistant_message(msg["content"])
+            else:
+                st.markdown(msg["content"])
 
     # ── Smart panels (replace chat input when active) ──────────────────────────
     chat_state = _get_chat_state()
@@ -917,7 +728,8 @@ def main():
     else:
         # Normal chat input
         placeholder = (
-            "Ask about analytics — e.g. 'basic analytics', 'uptime and obstacle time'…"
+            "e.g. 'client CEAT-Nagpur uptime yesterday'  |  "
+            "'client YOKOHAMA-DAHEJ obstacle time and utilization last week'"
             if ready
             else "Select a client and fleet(s) from the sidebar first…"
         )
@@ -946,7 +758,7 @@ def main():
                             )
                         except Exception as e:
                             response = f"⚠️ Error: {e}"
-                    st.markdown(response)
+                    _render_assistant_message(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 st.rerun()
             else:
@@ -973,7 +785,7 @@ def main():
                                     )
                                 except Exception as ex:
                                     response = f"⚠️ Error: {ex}"
-                            st.markdown(response)
+                            _render_assistant_message(response)
                         st.session_state.messages.append({"role": "assistant", "content": response})
                 st.rerun()
 
