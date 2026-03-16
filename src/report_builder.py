@@ -489,7 +489,15 @@ def build_pdf_from_text(
     pdf_path: str,
     report_dir: str | None = None,
 ) -> None:
-    """Build a client-ready PDF from the terminal text returned by sanjaya_chat."""
+    """Build a client-ready PDF from the Markdown text returned by sanjaya_chat.
+
+    Handles the Markdown format produced by summarize_basic_analytics and
+    format_metric_value(use_markdown=True):
+      - ``**Section Title**`` / ``**Section Title** (top N)``  → section header
+      - ``**Label:** value``                                    → inline KV pair
+      - ``| col | col |`` lines                                 → table
+      - ``---`` / blank lines                                   → section flush
+    """
     styles = getSampleStyleSheet()
     doc    = SimpleDocTemplate(
         pdf_path,
@@ -501,126 +509,128 @@ def build_pdf_from_text(
     _build_page_header(elements, styles, fleet_name, time_range, client_name, time_strings, report_dir)
 
     full = report_text.strip()
-    # Strip "Analytics Summary for X (Y):" wrapper (we have our own title)
+    # Strip "Analytics Summary for X (Y):" wrapper — we have our own page header.
     if full.startswith("Analytics Summary for "):
-        first_nl = full.find("\n\n")
-        full = full[first_nl + 2:].strip() if first_nl != -1 else ""
+        nl2 = full.find("\n\n")
+        full = full[nl2 + 2:].strip() if nl2 != -1 else ""
 
-    # ── Parse into (section_key, lines) chunks ──────────────────────────────
-    sections: List[Tuple[str, List[str]]] = []
-    current: List[str] = []
-    current_key: Optional[str] = None
+    # ── Markdown parsing helpers ─────────────────────────────────────────────
 
-    for raw_line in full.split("\n"):
-        line = raw_line.strip()
-        matched = None
-        if line:
-            for h in _SECTION_HEADERS:
-                if line.startswith(h) or line == h.rstrip(":"):
-                    matched = h
-                    break
-        if matched:
-            if current:
-                sections.append((current_key or "paragraph", current))
-                current = []
-            current_key = matched
-            continue
-        if not line:
-            if current:
-                sections.append((current_key or "paragraph", current))
-                current = []
-                current_key = None
-        else:
-            current.append(raw_line)
-
-    if current:
-        sections.append((current_key or "paragraph", current))
-
-    # ── Render each section ──────────────────────────────────────────────────
-    for key, lines in sections:
-        if not lines:
-            continue
-
-        # ── Known tabular / list sections ────────────────────────────────
-        meta = _SECTION_META.get(key)
-        if meta:
-            display_title, val_col_label, is_metric_fmt = meta
-            rows = (
-                _parse_metric_table_section(lines)
-                if is_metric_fmt
-                else _parse_trips_by_sherpa(lines)
-            )
-            if rows:
-                elements += _section_header(display_title, styles)
-                data = [[_p("Sherpa Name", styles), _p(val_col_label, styles)]]
-                for name, val in rows:
-                    data.append([_p(name, styles), _p(val, styles)])
-                elements.append(_make_table(data, _COL_SHERPA_2))
-                elements.append(Spacer(1, 0.2 * inch))
+    def _parse_md_table_lines(tlines: List[str]) -> Tuple[List[str], List[List[str]]]:
+        """Return (headers, data_rows) from markdown table lines, skipping separator."""
+        headers: List[str] = []
+        rows: List[List[str]] = []
+        for ln in tlines:
+            cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+            if all(re.match(r"^-+$", c) for c in cells if c.strip()):
+                continue  # separator row (---|---|---)
+            if not headers:
+                headers = cells
             else:
-                _append_section_as_paragraphs(elements, display_title, lines, styles)
-            continue
+                rows.append(cells)
+        return headers, rows
 
-        # ── Takt time: keep as formatted paragraphs (complex nested format) ─
-        if key == "Average Takt Time per Sherpa (minutes):":
-            elements += _section_header("Average Takt Time per Sherpa (minutes)", styles)
-            for ln in lines:
-                if ln.strip():
-                    elements.append(Paragraph(ln.replace("\n", "<br/>"), styles["Normal"]))
-            elements.append(Spacer(1, 0.2 * inch))
-            continue
+    def _col_widths_for(headers: List[str]) -> Optional[List[float]]:
+        n = len(headers)
+        if n == 2:
+            return _COL_KV if "metric" in headers[0].lower() else _COL_SHERPA_2
+        if n == 5:
+            return _COL_TAKT
+        w = _CONTENT_W / max(n, 1)
+        return [w] * n
 
-        # ── Generic paragraph section (Total trips / Total distance) ─────
-        if key == "paragraph":
-            summary_pairs: List[Tuple[str, str]] = []
-            other_lines:   List[str] = []
-            for ln in lines:
-                pair = _parse_summary_line(ln)
-                if pair:
-                    summary_pairs.append(pair)
-                else:
-                    other_lines.append(ln)
-
-            sherpa_table_label: Optional[str] = None
-            sherpa_table_rows:  Optional[List[Tuple[str, str]]] = None
-            metric_value_rows:  List[Tuple[str, str]] = []
-            for label, value in summary_pairs:
-                parsed = _parse_sherpa_value_list(value)
-                if parsed and label.lower() in ("total_trips", "trips", "total_distance_km", "total_distance", "distance"):
-                    sherpa_table_label = "Trip Count" if "trip" in label.lower() else "Distance (km)"
-                    sherpa_table_rows  = parsed
-                else:
-                    metric_value_rows.append((label, value))
-
-            if sherpa_table_rows:
-                section_t = "Trips by Sherpa" if "Trip" in (sherpa_table_label or "") else "Distance by Sherpa"
-                elements += _section_header(section_t, styles)
-                data = [[_p("Sherpa Name", styles), _p(sherpa_table_label or "Value", styles)]]
-                for name, val in sherpa_table_rows:
-                    data.append([_p(name, styles), _p(val, styles)])
-                elements.append(_make_table(data, _COL_SHERPA_2))
-                elements.append(Spacer(1, 0.2 * inch))
-
-            if metric_value_rows:
-                data = [[_p("Metric", styles), _p("Value", styles)]]
-                for label, value in metric_value_rows:
-                    data.append([_p(label, styles), _p(value, styles)])
-                elements.append(_make_table(data, _COL_KV))
-                elements.append(Spacer(1, 0.2 * inch))
-
-            for ln in other_lines:
-                if ln.strip():
-                    elements.append(Paragraph(ln.replace("\n", "<br/>"), styles["Normal"]))
-            continue
-
-        # ── Unknown section: plain text fallback ─────────────────────────
-        elements += _section_header(key.rstrip(":"), styles)
-        for ln in lines:
-            if ln.strip():
-                elements.append(Paragraph(ln.replace("\n", "<br/>"), styles["Normal"]))
+    def _flush_table(title: Optional[str], tlines: List[str]) -> None:
+        if not tlines:
+            return
+        headers, rows = _parse_md_table_lines(tlines)
+        if not headers or not rows:
+            return
+        n = len(headers)
+        data: List[List[Any]] = [[_p(h, styles) for h in headers]]
+        for row in rows:
+            padded = (row + [""] * n)[:n]
+            data.append([_p(str(c), styles) for c in padded])
+        if title:
+            elements.extend(_section_header(title, styles))
+        elements.append(_make_table(data, _col_widths_for(headers)))
         elements.append(Spacer(1, 0.2 * inch))
 
-    # ── Footer ─────────────────────────────────────────────────────────────
+    def _flush_kv(title: Optional[str], pairs: List[Tuple[str, str]]) -> None:
+        if not pairs:
+            return
+        if title:
+            elements.extend(_section_header(title, styles))
+        data: List[List[Any]] = [[_p("Metric", styles), _p("Value", styles)]]
+        for label, value in pairs:
+            data.append([_p(label, styles), _p(str(value), styles)])
+        elements.append(_make_table(data, _COL_KV))
+        elements.append(Spacer(1, 0.2 * inch))
+
+    # ── State machine ─────────────────────────────────────────────────────────
+    current_title: Optional[str] = None
+    table_buf: List[str]           = []
+    kv_buf: List[Tuple[str, str]]  = []
+
+    def flush() -> None:
+        nonlocal table_buf, kv_buf, current_title
+        if table_buf:
+            _flush_table(current_title, table_buf)
+            table_buf = []
+            current_title = None
+        elif kv_buf:
+            _flush_kv(current_title, kv_buf)
+            kv_buf = []
+            current_title = None
+
+    for line in full.split("\n"):
+        stripped = line.strip()
+
+        # Empty line / divider → flush accumulated content
+        if not stripped or stripped == "---":
+            flush()
+            continue
+
+        # Bold header or inline scalar: **Title** / **Title** (top N) / **Label:** value
+        bold_m = re.match(r"^\*\*([^*]+)\*\*\s*(.*)", stripped)
+        if bold_m:
+            flush()
+            raw  = bold_m.group(1).strip()
+            rest = bold_m.group(2).strip()
+            if raw.endswith(":") and rest:
+                # Inline scalar: **Total Trips:** 150
+                kv_buf.append((raw.rstrip(":"), rest))
+            else:
+                # Section header: **Trips by Sherpa** or **Trips by Sherpa** (top 10)
+                current_title = re.sub(r"\s*\(\s*top\s+\d+\s*\)", "", raw).strip().rstrip(":")
+            continue
+
+        # Markdown table row
+        if stripped.startswith("|"):
+            if kv_buf:
+                _flush_kv(current_title, kv_buf)
+                kv_buf = []
+                current_title = None
+            table_buf.append(stripped)
+            continue
+
+        # Plain text — flush table first
+        if table_buf:
+            _flush_table(current_title, table_buf)
+            table_buf = []
+            current_title = None
+
+        # Try parsing as "Key: value" (e.g. "Note: ..." lines are skipped)
+        if (": " in stripped
+                and not stripped.startswith("-")
+                and not stripped.startswith(">")
+                and not stripped.startswith("Note:")):
+            label, value = stripped.split(": ", 1)
+            if label.strip():
+                kv_buf.append((label.strip(), value.strip()))
+
+    flush()
+
+    # ── Footer ───────────────────────────────────────────────────────────────
     elements.append(Spacer(1, 0.3 * inch))
     elements.append(HRFlowable(width=_CONTENT_W, thickness=0.5, color=_BORDER))
     footer_style = ParagraphStyle("Footer", parent=styles["Normal"], textColor=_FOOTER_FG, fontSize=8)
@@ -632,6 +642,13 @@ def build_pdf_from_text(
 
 # ── Email sender ──────────────────────────────────────────────────────────────
 
+def _parse_recipients(raw: Optional[List[str]]) -> List[str]:
+    """Normalise recipients — handles comma-separated strings in each entry."""
+    if raw:
+        return [e.strip() for entry in raw for e in entry.split(",") if e.strip()]
+    return [e.strip() for e in REPORT_RECIPIENT.split(",") if e.strip()]
+
+
 def send_report_email(
     pdf_path: str,
     subject: str,
@@ -639,7 +656,7 @@ def send_report_email(
     recipients: Optional[List[str]] = None,
 ) -> None:
     """Send PDF report to recipients via SMTP, then delete the temporary file."""
-    to = recipients if recipients else [REPORT_RECIPIENT]
+    to = _parse_recipients(recipients)
     try:
         _send_email(pdf_path, to, [], subject)
     finally:

@@ -274,13 +274,13 @@ async def handle_chat(
     # ── Main query ────────────────────────────────────────────────────────
     try:
         clean_text = text.replace("[sherpa:all]", "").strip()
-        empty_defaults = {
-            "fm_client_name": "",
-            "fleet_name": "",
-            "timezone": defaults.get("timezone", "Asia/Kolkata"),
-            "time_phrase": defaults.get("time_phrase", "today"),
+        effective_defaults = {
+            "fm_client_name": defaults.get("fm_client_name", ""),
+            "fleet_name":     defaults.get("fleet_name", ""),
+            "timezone":       defaults.get("timezone", "Asia/Kolkata"),
+            "time_phrase":    defaults.get("time_phrase", "today"),
         }
-        pq = await parse_query(clean_text, defaults=empty_defaults)
+        pq = await parse_query(clean_text, defaults=effective_defaults)
 
         t_lower = clean_text.lower()
 
@@ -360,13 +360,16 @@ async def _execute_query(
 ) -> str:
     """Resolve names, validate required fields (asking user if missing), then fetch data."""
 
-    # Prompt-first mode: client and fleet MUST come from NLU (the user's prompt).
-    # We do NOT fall back to env defaults for those — if they're missing we ask.
-    # Timezone is safe to default (user rarely types it). Time phrase we ask for if absent.
-    client_from_nlu = bool(pq.fm_client_name)
-    client_name = pq.fm_client_name or None          # never use env default for client
-    fleet_name  = pq.fleet_name or None              # never use env default for fleet
-    time_phrase = pq.time_phrase or defaults.get("time_phrase") or None   # ask if still None
+    # Dropdown priority: if sidebar provided a value, it overrides NLU.
+    # NLU is the fallback when the dropdown is empty/unselected.
+    sidebar_client = defaults.get("fm_client_name", "")
+    sidebar_fleet  = defaults.get("fleet_name", "")
+    sidebar_time   = defaults.get("time_phrase", "")
+
+    client_from_nlu = bool(sidebar_client) or bool(pq.fm_client_name)
+    client_name = sidebar_client or pq.fm_client_name or None
+    fleet_name  = sidebar_fleet  or pq.fleet_name  or None
+    time_phrase = sidebar_time   or pq.time_phrase  or None
     timezone    = pq.timezone
     if not timezone or str(timezone).lower() in ("null", "none", ""):
         timezone = defaults.get("timezone") or "Asia/Kolkata"

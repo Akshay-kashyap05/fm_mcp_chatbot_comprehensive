@@ -300,3 +300,4 @@ def generate_and_send_text_report(
         logger.info("Text-based report generated and sent: %s", pdf_filename)
     except Exception as e:
         logger.warning("Text-based report generation/send failed: %s", e)
+        raise

@@ -12,7 +12,7 @@ import concurrent.futures
 import os
 import re
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime as _dt, time as _time, timedelta
 from typing import Optional
 
 try:
@@ -218,11 +218,11 @@ def _process_message(
     timezone = os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata")
     return _run(mcp_client.chat(
         prompt,
-        # Dropdown-backup (disabled): uncomment to pass sidebar context as defaults
-        # client_name=client_name,
-        # fleet_name=fleet_names[0] if fleet_names else "",
-        # fleet_names=fleet_names if fleet_names and len(fleet_names) > 1 else None,
-        # time_phrase=time_phrase,
+        # Dropdown values take priority; NLU fallback when empty
+        client_name=client_name,
+        fleet_name=fleet_names[0] if fleet_names else "",
+        fleet_names=fleet_names if fleet_names and len(fleet_names) > 1 else None,
+        time_phrase=time_phrase,
         timezone=timezone,
         recipient_email=recipient_email or None,
         server_url=url,
@@ -240,13 +240,13 @@ def _process_confirmed(data: dict) -> str:
     url         = st.session_state.mcp_url
     prompt_text = data.get("edited_prompt") or data.get("original_prompt", "")
     timezone    = data.get("timezone", os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata"))
+    fl_list = data.get("fleet_names") or ([data.get("fleet_name", "")] if data.get("fleet_name") else [])
     return _run(mcp_client.chat(
         prompt_text,
-        # Dropdown-backup (disabled): uncomment to pass resolved context as defaults
-        # client_name=data.get("client_name", ""),
-        # fleet_name=(data.get("fleet_names") or [data.get("fleet_name", "")])[0],
-        # fleet_names=data.get("fleet_names") if len(data.get("fleet_names") or []) > 1 else None,
-        # time_phrase=data.get("time_phrase", ""),
+        client_name=data.get("client_name", ""),
+        fleet_name=fl_list[0] if fl_list else "",
+        fleet_names=fl_list if len(fl_list) > 1 else None,
+        time_phrase=data.get("time_phrase", ""),
         timezone=timezone,
         server_url=url,
     ))
@@ -387,74 +387,64 @@ def _render_sidebar() -> tuple[str, list[str], list[str], str]:
         st.markdown("## 📊 Sanjaya Analytics")
         st.divider()
 
-        # ── Client / Fleet / Sherpa dropdowns (disabled — prompt-first mode) ────
-        # Dropdowns are kept in code as backup. Re-enable by uncommenting below
-        # and removing the empty defaults. When re-enabled, sidebar values become
-        # the fallback when the user's prompt contains no client/fleet info.
-        #
-        # if not st.session_state.clients_list:
-        #     with st.spinner("Loading clients…"):
-        #         try:
-        #             st.session_state.clients_list = _load_clients()
-        #         except Exception as e:
-        #             st.error(f"Could not load clients: {e}")
-        #
-        # st.subheader("Query Context")
-        #
-        # selected_client: str = st.selectbox(
-        #     "Client",
-        #     options=[""] + st.session_state.clients_list,
-        #     format_func=lambda x: "— select client —" if x == "" else x,
-        #     key="sel_client",
-        # )
-        # fleet_options: list[str] = []
-        # if selected_client:
-        #     if selected_client not in st.session_state.fleet_map:
-        #         with st.spinner("Loading fleets…"):
-        #             try:
-        #                 st.session_state.fleet_map[selected_client] = _load_fleets(selected_client)
-        #             except Exception as e:
-        #                 st.error(f"Could not load fleets: {e}")
-        #                 st.session_state.fleet_map[selected_client] = []
-        #     fleet_options = st.session_state.fleet_map.get(selected_client, [])
-        # selected_fleets: list[str] = st.multiselect(
-        #     "Fleet(s)", options=fleet_options, disabled=not selected_client,
-        #     placeholder="Select one or more fleets…", key="sel_fleets",
-        # )
-        # sherpa_options: list[str] = []
-        # if selected_client and selected_fleets:
-        #     sherpa_key = f"{selected_client}::{':'.join(sorted(selected_fleets))}"
-        #     if sherpa_key not in st.session_state.sherpa_map:
-        #         with st.spinner("Loading sherpas…"):
-        #             try:
-        #                 st.session_state.sherpa_map[sherpa_key] = _load_sherpas(
-        #                     selected_client, selected_fleets
-        #                 )
-        #             except Exception as e:
-        #                 st.error(f"Could not load sherpas: {e}")
-        #                 st.session_state.sherpa_map[sherpa_key] = []
-        #     sherpa_options = st.session_state.sherpa_map.get(sherpa_key, [])
-        # selected_sherpas: list[str] = st.multiselect(
-        #     "Sherpa(s)", options=sherpa_options, disabled=not selected_fleets,
-        #     placeholder="All sherpas (default)…", key="sel_sherpas",
-        # )
+        # ── Client / Fleet / Sherpa dropdowns ────────────────────────────────
+        # Sidebar values have PRIORITY over NLU.  Leave selections empty to let
+        # NLU extract them from your prompt instead.
+        if not st.session_state.clients_list:
+            with st.spinner("Loading clients…"):
+                try:
+                    st.session_state.clients_list = _load_clients()
+                except Exception as e:
+                    st.error(f"Could not load clients: {e}")
 
-        # Prompt-first mode: all context comes from the user's prompt via NLU
-        selected_client: str = ""
-        selected_fleets: list[str] = []
-        selected_sherpas: list[str] = []
-        st.info(
-            "💬 **Prompt-first mode**\n\n"
-            "**Format:** `client <name> [fleet <name>] <metric> <time>`\n\n"
-            "Examples:\n"
-            "- `client CEAT-Nagpur uptime yesterday`\n"
-            "- `client YOKOHAMA-DAHEJ fleet BEAD total trips last week`\n"
-            "- `client CEAT-Nagpur tug-104 obstacle time`\n\n"
-            "Fuzzy matching is on — close spellings work.\n"
-            "Omit fleet → queries all fleets."
+        st.subheader("Query Context")
+        st.caption("Select to override NLU, or leave blank to use your prompt.")
+
+        selected_client: str = st.selectbox(
+            "Client",
+            options=[""] + st.session_state.clients_list,
+            format_func=lambda x: "— from prompt —" if x == "" else x,
+            key="sel_client",
         )
 
-        # ── Time range with custom date picker ────────────────────────────────
+        fleet_options: list[str] = []
+        if selected_client:
+            if selected_client not in st.session_state.fleet_map:
+                with st.spinner("Loading fleets…"):
+                    try:
+                        st.session_state.fleet_map[selected_client] = _load_fleets(selected_client)
+                    except Exception as e:
+                        st.error(f"Could not load fleets: {e}")
+                        st.session_state.fleet_map[selected_client] = []
+            fleet_options = st.session_state.fleet_map.get(selected_client, [])
+
+        selected_fleets: list[str] = st.multiselect(
+            "Fleet(s)", options=fleet_options, disabled=not selected_client,
+            placeholder="All fleets (default)…", key="sel_fleets",
+        )
+
+        sherpa_options: list[str] = []
+        if selected_client and selected_fleets:
+            sherpa_key = f"{selected_client}::{':'.join(sorted(selected_fleets))}"
+            if sherpa_key not in st.session_state.sherpa_map:
+                with st.spinner("Loading sherpas…"):
+                    try:
+                        st.session_state.sherpa_map[sherpa_key] = _load_sherpas(
+                            selected_client, selected_fleets
+                        )
+                    except Exception as e:
+                        st.error(f"Could not load sherpas: {e}")
+                        st.session_state.sherpa_map[sherpa_key] = []
+            sherpa_options = st.session_state.sherpa_map.get(sherpa_key, [])
+
+        selected_sherpas: list[str] = st.multiselect(
+            "Sherpa(s)", options=sherpa_options, disabled=not selected_fleets,
+            placeholder="All sherpas (default)…", key="sel_sherpas",
+        )
+
+        st.divider()
+
+        # ── Time range with custom date + time pickers ────────────────────────
         time_label: str = st.selectbox(
             "Time Range",
             options=list(TIME_OPTIONS.keys()),
@@ -463,28 +453,49 @@ def _render_sidebar() -> tuple[str, list[str], list[str], str]:
         )
 
         if time_label == "Custom Range":
-            st.caption("Pick a date range:")
+            st.caption("Pick a date and time range:")
             col1, col2 = st.columns(2)
             with col1:
                 start_d: date = st.date_input(
-                    "From",
+                    "From date",
                     value=date.today() - timedelta(days=7),
                     max_value=date.today(),
                     key="custom_start",
                 )
+                start_t: _time = st.time_input(
+                    "Start time",
+                    value=_time(0, 0),
+                    key="custom_start_t",
+                )
             with col2:
                 end_d: date = st.date_input(
-                    "To",
+                    "To date",
                     value=date.today() - timedelta(days=1),
                     max_value=date.today(),
                     key="custom_end",
                 )
-            if start_d <= end_d:
-                # Format: "01 Jan 2026 to 07 Jan 2026" — parse_time_range handles this
-                time_phrase = (
-                    f"{start_d.strftime('%d %b %Y')} to {end_d.strftime('%d %b %Y')}"
+                end_t: _time = st.time_input(
+                    "End time",
+                    value=_time(23, 59),
+                    key="custom_end_t",
                 )
-                time_display = f"{start_d} → {end_d}"
+            if start_d <= end_d:
+                # Format: "01 Jan 2026 9am to 07 Jan 2026 8pm" — parse_time_range handles this
+                def _fmt_hour(h: int) -> str:
+                    if h == 0:
+                        return "12am"
+                    if h < 12:
+                        return f"{h}am"
+                    if h == 12:
+                        return "12pm"
+                    return f"{h - 12}pm"
+                start_h = _fmt_hour(start_t.hour)
+                end_h   = _fmt_hour(end_t.hour)
+                time_phrase = (
+                    f"{start_d.strftime('%d %b %Y')} {start_h} to "
+                    f"{end_d.strftime('%d %b %Y')} {end_h}"
+                )
+                time_display = f"{start_d} {start_t.strftime('%H:%M')} → {end_d} {end_t.strftime('%H:%M')}"
             else:
                 st.error("Start date must be ≤ end date.")
                 time_phrase = "yesterday"
@@ -493,12 +504,7 @@ def _render_sidebar() -> tuple[str, list[str], list[str], str]:
             time_phrase   = TIME_OPTIONS[time_label]
             time_display  = time_label
 
-        st.divider()
-
-        # In prompt-first mode, chat is always ready
-        ready = True
         st.caption(f"📅 {time_display}")
-
         st.divider()
 
         if st.button("🗑️ Clear Chat", use_container_width=True):
@@ -622,7 +628,7 @@ def main():
     st.session_state._ctx_sherpas = selected_sherpas
     st.session_state._ctx_time    = time_phrase
 
-    ready = True  # prompt-first mode: chat is always ready (dropdowns disabled)
+    ready = True  # chat is always ready; dropdowns augment NLU when filled
 
     # ── Chat area ─────────────────────────────────────────────────────────────
     st.markdown("# Sanjaya Analytics Chat")
@@ -693,12 +699,13 @@ def main():
             st.markdown("**📧 Email this report as PDF**")
             default_email = os.environ.get("REPORT_RECIPIENT", "")
             email = st.text_input(
-                "Recipient email address",
+                "Recipient email address(es)",
                 value=st.session_state.get("recipient_email") or default_email,
-                placeholder="email@example.com",
-                help="Enter the address that should receive this PDF report",
+                placeholder="a@example.com, b@example.com",
+                help="One address or comma-separated list for multiple recipients",
                 key="email_input",
             )
+            st.caption("Multiple recipients? Separate with commas — e.g. `a@x.com, b@y.com`")
             if default_email:
                 st.caption(
                     f"Default from `.env`: **{default_email}** — edit above to override for this report"
