@@ -24,6 +24,7 @@ ROUTE_ANALYTICS_ITEMS = (
     "top_10_routes_takt", "top_routes_takt",
     "route_utilization",
     "avg_obstacle_per_route",
+    "route_analytics",  # generic "route analytics" query — handled in extract_item_value
 )
 
 _SHERPA_LIST_VALUE_KEY: Dict[str, tuple] = {
@@ -61,7 +62,10 @@ def format_metric_value(metric: str, val: Any, note: str, use_markdown: bool = F
     """
     label = _METRIC_DISPLAY_LABEL.get(metric, metric.replace("_", " ").title())
 
-    if isinstance(val, list) and val and isinstance(val[0], dict):
+    if isinstance(val, list) and not val:
+        # Empty list — no data returned for this metric
+        result = f"**{label}:** No data available" if use_markdown else f"{label}: No data available"
+    elif isinstance(val, list) and isinstance(val[0], dict):
         key, unit = _SHERPA_LIST_VALUE_KEY.get(metric, (None, ""))
 
         rows = []
@@ -99,9 +103,9 @@ def format_metric_value(metric: str, val: Any, note: str, use_markdown: bool = F
             result = "\n".join(lines)
     else:
         if use_markdown:
-            result = f"**{label}:** {val}"
+            result = f"**{label}:** {val}" if val is not None else f"**{label}:** No data available"
         else:
-            result = f"{label}: {val}"
+            result = f"{label}: {val}" if val is not None else f"{label}: No data available"
 
     if note:
         result += f"\n{'> ' if use_markdown else ''}Note: {note}"
@@ -144,16 +148,21 @@ async def fetch_analytics_data_and_summary(
     api,
     client_cache,
     sherpa_cache,
+    selected_sherpas: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """Fetch basic_analytics and return (summary_text, data, time_strings)."""
     await api.ensure_token()
     tr = parse_time_range(time_range, timezone=timezone)
     time_strings = tr.to_strings()
-    sherpa_names = await resolve_sherpa_names_for_fleet(
-        client_name, fleet_name,
-        api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
-    )
-    api_sherpa = sherpa_names if sherpa_names else None
+    if selected_sherpas:
+        # User explicitly selected sherpas from dropdown — use directly
+        api_sherpa = selected_sherpas
+    else:
+        sherpa_names = await resolve_sherpa_names_for_fleet(
+            client_name, fleet_name,
+            api=api, client_cache=client_cache, sherpa_cache=sherpa_cache,
+        )
+        api_sherpa = sherpa_names if sherpa_names else None
     data = await api.basic_analytics(
         fm_client_name=client_name,
         start_time=time_strings["start_time"],
@@ -181,6 +190,7 @@ async def get_metric_response_and_data(
     client_cache,
     sherpa_cache,
     sherpa_name: Optional[str] = None,
+    selected_sherpas: Optional[List[str]] = None,
     use_markdown: bool = True,
 ) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """Fetch a specific metric and return (response_text, data, time_strings)."""
@@ -188,12 +198,17 @@ async def get_metric_response_and_data(
     tr = parse_time_range(time_range, timezone=timezone)
     time_strings = tr.to_strings()
 
-    api_sherpa_name = sherpa_name
-    if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
-        api_sherpa_name = None
+    # Dropdown selection takes priority — use directly, skip all resolve logic
+    if selected_sherpas:
+        api_sherpa_name = selected_sherpas
+        logger.info("Using %d selected sherpas for metric '%s': %s", len(selected_sherpas), metric, selected_sherpas)
+    else:
+        api_sherpa_name = sherpa_name
+        if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
+            api_sherpa_name = None
 
     # ── Sherpa hint provided — resolve to exact API name ─────────────────────
-    if isinstance(api_sherpa_name, str) and api_sherpa_name:
+    if not selected_sherpas and isinstance(api_sherpa_name, str) and api_sherpa_name:
         try:
             all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
             matched_client = resolve_client(client_name, all_clients)
@@ -216,7 +231,7 @@ async def get_metric_response_and_data(
         except Exception as e:
             logger.warning("Sherpa hint resolution failed: %s", e)
 
-    if api_sherpa_name is None:
+    if not selected_sherpas and api_sherpa_name is None:
         try:
             all_clients = await client_cache.get_or_set("all_clients", api.get_clients)
             matched = resolve_client(client_name, all_clients)

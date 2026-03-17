@@ -55,7 +55,8 @@ _PROJECT_ROOT = os.environ.get("SANJAYA_PROJECT_ROOT") or os.path.normpath(
 # Fallback when no prompts Variable: single report time range (e.g. "today", "yesterday")
 TIME_RANGE = "yesterday"
 
-# Daily at 08:00 (scheduler timezone). Change as needed, e.g. "0 9 * * *" for 09:00
+# Runs every 10 min so per-client schedule gates (hourly/daily/weekly) fire at the right time.
+# Do NOT change to a less-frequent cron — the gates inside _run_all() handle actual send frequency.
 SCHEDULE_CRON = "*/10 * * * *"
 
 
@@ -79,10 +80,11 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
     from src.sanjaya_client import SanjayaAPI
     from src.nlu import parse_query
     from src.report_builder import (
-        build_pdf, send_report_email,
+        build_pdf_from_text, send_report_email, filter_payload_for_sections,
         SECTION_TRIPS, SECTION_AVAILABILITY, SECTION_UTILIZATION,
         SECTION_DISTANCE, SECTION_UPTIME, SECTION_ROUTE_ANALYTICS,
     )
+    from src.formatting import summarize_basic_analytics
 
     base_url = os.environ.get("SANJAYA_BASE_URL", "https://sanjaya.atimotors.com")
     default_tz = os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata")
@@ -176,20 +178,16 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
                 result.add(constant)
         return result if result else None
 
-    async def _fetch_and_send_one(
+    async def _fetch_fleet_text(
         client_name: str,
         fleet_name: str,
         time_phrase: str,
         timezone: str,
-        item: str | None = None,
         sections_override: set | None = None,
-        recipients: list | None = None,
-    ) -> None:
-        # sections_override (from client config) takes priority over NLU item
-        sections = sections_override if sections_override is not None else _sections_for_item(item)
+    ) -> tuple[str, dict]:
+        """Fetch analytics for one fleet and return (summary_text, time_strings)."""
         api = SanjayaAPI(base_url, debug_http=False)
         await api.ensure_token()
-        # Same as MCP: resolve sherpa names for fleet so API returns trip data (not empty)
         sherpa_names = await api.get_sherpa_names_for_fleet(client_name, fleet_name)
         api_sherpa = sherpa_names if sherpa_names else None
         tr = parse_time_range(time_phrase, time_zone=timezone, now=reference_now)
@@ -203,54 +201,44 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
             status=["succeeded", "failed", "cancelled"],
             sherpa_name=api_sherpa,
         )
-
         merged: dict = {}
-
-        # Decide which APIs to call based on what sections are needed
-        needs_route = (
-            sections is None  # full report → always call both
-            or SECTION_ROUTE_ANALYTICS in (sections or set())
-        )
-        needs_basic = (
-            sections is None
-            or bool((sections or set()) - {SECTION_ROUTE_ANALYTICS})
-        )
-
-        # Call basic_analytics unless only route analytics sections are needed
-        if needs_basic and item not in _ROUTE_ANALYTICS_ITEMS:
+        needs_route = sections_override is None or SECTION_ROUTE_ANALYTICS in (sections_override or set())
+        needs_basic = sections_override is None or bool((sections_override or set()) - {SECTION_ROUTE_ANALYTICS})
+        if needs_basic:
             basic_raw = await api.basic_analytics(**api_kwargs)
             basic_inner = basic_raw.get("data") if isinstance(basic_raw.get("data"), dict) else basic_raw
             merged.update(basic_inner)
-
-        # Call route_analytics for full reports or when route analytics sections needed
-        if needs_route or item in _ROUTE_ANALYTICS_ITEMS:
+        if needs_route:
             try:
                 route_raw = await api.route_analytics(**api_kwargs)
                 route_inner = route_raw.get("data") if isinstance(route_raw.get("data"), dict) else route_raw
                 merged.update(route_inner)
             except Exception as exc:
-                logger.warning("route_analytics failed for client=%s fleet=%s: %s", client_name, fleet_name, exc)
+                logger.warning("route_analytics failed for %s/%s: %s", client_name, fleet_name, exc)
+        filtered = filter_payload_for_sections(merged, sections_override)
+        summary_text = summarize_basic_analytics(filtered)
+        return summary_text, time_strings
 
-        # Log when API returns empty so you can debug client/fleet/date
-        has_data = (
-            len(merged.get("sherpa_wise_trips") or []) > 0
-            or merged.get("total_trips") is not None
-            or merged.get("total_distance_km") is not None
-            or len(merged.get("availability") or []) > 0
-            or len(merged.get("utilization") or []) > 0
-            or len(merged.get("avg_takt_per_sherpa") or []) > 0
+    async def _fetch_and_send_one(
+        client_name: str,
+        fleet_name: str,
+        time_phrase: str,
+        timezone: str,
+        item: str | None = None,
+        sections_override: set | None = None,
+        recipients: list | None = None,
+    ) -> None:
+        # sections_override (from client config) takes priority over NLU item
+        sections = sections_override if sections_override is not None else _sections_for_item(item)
+        summary_text, time_strings = await _fetch_fleet_text(
+            client_name, fleet_name, time_phrase, timezone, sections,
         )
-        if not has_data:
-            logger.warning(
-                "analytics returned no data for client=%s fleet=%s range=%s to %s",
-                client_name, fleet_name, time_strings.get("start_time"), time_strings.get("end_time"),
-            )
         safe_name = (client_name + "_" + fleet_name).replace(" ", "-")[:50]
         pdf_filename = f"Analytics-Report-{safe_name}-{datetime.now().strftime('%Y-%m-%d')}.pdf"
-        pdf_path = os.path.join("/tmp", pdf_filename)   # /tmp is always writable in any container/env
-        build_pdf(
-            merged, client_name, fleet_name, time_phrase, time_strings,
-            pdf_path, report_dir=project_root, sections_to_include=sections,
+        pdf_path = os.path.join("/tmp", pdf_filename)
+        build_pdf_from_text(
+            summary_text, client_name, fleet_name, time_phrase, time_strings,
+            pdf_path, report_dir=project_root,
         )
         subject = f"Analytics Report - {fleet_name} - {time_phrase}"
         send_report_email(pdf_path, subject, report_dir=project_root, recipients=recipients)
@@ -285,10 +273,18 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
             if not isinstance(cfg, dict):
                 continue
             client_name = (cfg.get("client_name") or "").strip()
-            fleet_name = (cfg.get("fleet_name") or "").strip()
-            if not client_name or not fleet_name:
-                logger.warning("client_report_config.json entry missing client_name or fleet_name: %s", cfg)
+
+            # Support new fleet_names (list) and legacy fleet_name (str)
+            raw_fleets = cfg.get("fleet_names") or []
+            if not raw_fleets:
+                fn = (cfg.get("fleet_name") or "").strip()
+                raw_fleets = [fn] if fn else []
+            fleet_names_list = [f.strip() for f in raw_fleets if f.strip()]
+
+            if not client_name or not fleet_names_list:
+                logger.warning("client_report_config.json entry missing client_name or fleet_names: %s", cfg)
                 continue
+
             # Schedule gate: honour schedule_type (hourly / daily / weekly).
             # Entries without schedule_type default to legacy "daily" behaviour.
             # Manual UI triggers bypass all gates so every entry always runs.
@@ -298,22 +294,16 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
                 run_day = cfg.get("run_day")
 
                 if schedule_type == "every_20min":
-                    # Fire in any 10-min window that starts at a 20-min boundary
-                    # (:00-:09, :20-:29, :40-:49). Using a window instead of exact
-                    # match avoids failures from Airflow logical_date offsets or
-                    # task start lag that shift the actual minute by a few seconds/minutes.
                     ref = reference_now if reference_now else datetime.now()
                     if ref.minute % 20 >= 10:
                         continue
                 elif schedule_type == "hourly":
-                    # Fire only in the first cycle of each hour (minute 0–9).
-                    # The DAG runs every 10 min, so this gives exactly one run/hour.
                     ref = reference_now if reference_now else datetime.now()
                     if ref.minute >= 10:
                         continue
                 elif schedule_type == "weekly":
                     ref = reference_now if reference_now else datetime.now()
-                    current_weekday = ref.weekday()  # 0=Monday, 6=Sunday
+                    current_weekday = ref.weekday()
                     if run_day is not None:
                         try:
                             if int(run_day) != current_weekday:
@@ -328,8 +318,6 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
                             pass
                 else:  # "daily" (default / legacy)
                     ref = reference_now if reference_now else datetime.now()
-                    # Only fire in the first 10-minute window of the scheduled hour
-                    # (DAG ticks every 10 min, so this gives exactly one run/day)
                     if ref.minute >= 10:
                         continue
                     if run_hour is not None:
@@ -338,16 +326,49 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
                                 continue
                         except (ValueError, TypeError):
                             pass
+
             time_phrase = (cfg.get("time_phrase") or TIME_RANGE).strip()
             if not _is_relative_time_phrase(time_phrase):
                 time_phrase = TIME_RANGE
             timezone = (cfg.get("timezone") or default_tz).strip()
             sections = _sections_from_config(cfg.get("sections"))
-            logger.info("Running configured report: client=%s fleet=%s sections=%s", client_name, fleet_name, cfg.get("sections"))
-            await _fetch_and_send_one(
-                client_name, fleet_name, time_phrase, timezone,
-                sections_override=sections, item=None, recipients=airflow_recipients,
-            )
+
+            if len(fleet_names_list) == 1:
+                # Single fleet — one report, existing behaviour
+                fleet_name = fleet_names_list[0]
+                logger.info("Running configured report: client=%s fleet=%s sections=%s", client_name, fleet_name, cfg.get("sections"))
+                await _fetch_and_send_one(
+                    client_name, fleet_name, time_phrase, timezone,
+                    sections_override=sections, item=None, recipients=airflow_recipients,
+                )
+            else:
+                # Multiple fleets — fetch each and send ONE combined report
+                logger.info("Running multi-fleet report: client=%s fleets=%s sections=%s", client_name, fleet_names_list, cfg.get("sections"))
+                fleet_texts = []
+                combined_time_strings: dict = {}
+                for fleet_name in fleet_names_list:
+                    try:
+                        fleet_text, fleet_time_strings = await _fetch_fleet_text(
+                            client_name, fleet_name, time_phrase, timezone, sections,
+                        )
+                        fleet_texts.append(f"**Fleet: {fleet_name}**\n\n{fleet_text}")
+                        combined_time_strings = fleet_time_strings
+                    except Exception as exc:
+                        logger.warning("Failed to fetch data for fleet %s: %s", fleet_name, exc)
+                        fleet_texts.append(f"**Fleet: {fleet_name}**\n\nData unavailable: {exc}")
+
+                if fleet_texts:
+                    combined = "\n\n---\n\n".join(fleet_texts)
+                    safe_name = client_name.replace(" ", "-")[:40]
+                    pdf_filename = f"Analytics-Report-{safe_name}-{datetime.now().strftime('%Y-%m-%d')}.pdf"
+                    pdf_path = os.path.join("/tmp", pdf_filename)
+                    build_pdf_from_text(
+                        combined, client_name, ", ".join(fleet_names_list),
+                        time_phrase, combined_time_strings, pdf_path, report_dir=project_root,
+                    )
+                    subject = f"Analytics Report - {client_name} ({len(fleet_names_list)} fleets) - {time_phrase}"
+                    send_report_email(pdf_path, subject, report_dir=project_root, recipients=airflow_recipients)
+
             ran_any = True
 
         # 2) Ad-hoc report from scheduled_report_prompts.json (written by chat)
@@ -390,12 +411,8 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
                 await _fetch_and_send_one(client_name, fleet_name, time_phrase, timezone, item=item, recipients=airflow_recipients)
                 ran_any = True
 
-        # 3) Fallback: nothing configured → use .env defaults
-        if not ran_any:
-            await _fetch_and_send_one(
-                default_client, default_fleet, TIME_RANGE, default_tz,
-                item=None, recipients=airflow_recipients,
-            )
+        # No fallback — if client_report_config.json has no entries and no prompts,
+        # the DAG simply does nothing this cycle. Unsolicited reports should never fire.
 
     asyncio.run(_run_all())
 

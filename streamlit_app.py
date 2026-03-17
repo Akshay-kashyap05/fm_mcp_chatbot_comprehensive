@@ -216,13 +216,21 @@ def _process_message(
     """
     url      = st.session_state.mcp_url
     timezone = os.environ.get("SANJAYA_DEFAULT_TZ", "Asia/Kolkata")
+    # Control commands AND schedule commands must NOT carry fleet_names.
+    # sanjaya_chat routes on len(fleet_names) > 1 BEFORE checking the command,
+    # which causes multi-fleet analytics re-run instead of email send / schedule.
+    _sched_prefixes = ("daily", "hourly", "weekly", "every 20", "every hour")
+    _p = prompt.strip().lower()
+    is_ctrl = _p in _CONTROL_CMDS or any(_p.startswith(kw) for kw in _sched_prefixes)
     return _run(mcp_client.chat(
         prompt,
         # Dropdown values take priority; NLU fallback when empty
-        client_name=client_name,
-        fleet_name=fleet_names[0] if fleet_names else "",
-        fleet_names=fleet_names if fleet_names and len(fleet_names) > 1 else None,
-        time_phrase=time_phrase,
+        client_name="" if is_ctrl else client_name,
+        fleet_name="" if is_ctrl else (fleet_names[0] if fleet_names else ""),
+        fleet_names=None if is_ctrl else (fleet_names if fleet_names and len(fleet_names) > 1 else None),
+        sherpa_name="" if is_ctrl else (sherpa_names[0] if sherpa_names else ""),
+        sherpa_names=None if is_ctrl else (sherpa_names if sherpa_names else None),
+        time_phrase="" if is_ctrl else time_phrase,
         timezone=timezone,
         recipient_email=recipient_email or None,
         server_url=url,
@@ -731,6 +739,17 @@ def main():
                     if st.button(label, use_container_width=True, key=f"sched_{i}"):
                         st.session_state.pending_action = ("schedule", cmd)
                         st.rerun()
+
+            st.divider()
+            st.caption("Or type a custom schedule — e.g. `daily 2pm`, `daily 14:30`, `weekly friday 9am`, `hourly`")
+            custom_sched = st.text_input(
+                "Custom schedule", placeholder="daily 2pm  /  weekly tuesday 14:30  /  hourly",
+                key="custom_sched_input", label_visibility="collapsed",
+            )
+            if st.button("Set custom schedule", key="sched_custom_btn", use_container_width=True):
+                if custom_sched.strip():
+                    st.session_state.pending_action = ("schedule", custom_sched.strip())
+                    st.rerun()
 
     else:
         # Normal chat input

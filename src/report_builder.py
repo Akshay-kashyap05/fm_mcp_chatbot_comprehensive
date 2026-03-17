@@ -96,6 +96,34 @@ def _section_header(title: str, styles: Any) -> List[Any]:
     return [Spacer(1, 0.15 * inch), Paragraph(title, style), Spacer(1, 0.06 * inch)]
 
 
+def _fleet_banner(fleet_name: str, styles: Any) -> List[Any]:
+    """Render a prominent fleet divider band for multi-fleet reports."""
+    bg_style = ParagraphStyle(
+        "FleetBanner",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        textColor=colors.white,
+        backColor=_HEADER_BG,
+        spaceAfter=4,
+        spaceBefore=4,
+        leftIndent=6,
+        rightIndent=6,
+    )
+    banner = Table(
+        [[Paragraph(f"Fleet: {fleet_name}", bg_style)]],
+        colWidths=[_CONTENT_W],
+    )
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), _HEADER_BG),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]))
+    return [Spacer(1, 0.2 * inch), banner, Spacer(1, 0.1 * inch)]
+
+
 # ── Column-width presets (landscape Letter, ~9.8 in usable) ──────────────────
 _COL_SHERPA_2  = [6.8 * inch, 3.0 * inch]   # Sherpa Name | metric
 _COL_KV        = [4.0 * inch, 5.8 * inch]   # Key | Value (summary metrics)
@@ -112,6 +140,37 @@ SECTION_UPTIME         = "uptime"
 SECTION_ROUTE_ANALYTICS = "route_analytics"
 SECTION_SHERPA_STATUS  = "sherpa_status"
 SECTION_ACTIVITY       = "activity"
+
+
+# ── Section → payload key mapping (for filtering before summarize) ────────────
+_SECTION_PAYLOAD_KEYS: Dict[str, List[str]] = {
+    SECTION_TRIPS:          ["total_trips", "sherpa_wise_trips"],
+    SECTION_DISTANCE:       ["total_distance_km", "sherpa_wise_distance"],
+    SECTION_AVAILABILITY:   ["availability"],
+    SECTION_UTILIZATION:    ["utilization"],
+    SECTION_UPTIME:         ["uptime"],
+    SECTION_ROUTE_ANALYTICS: [
+        "avg_takt_per_sherpa", "avg_obstacle_per_sherpa",
+        "top_10_routes_takt", "route_utilization", "avg_obstacle_per_route",
+    ],
+}
+
+
+def filter_payload_for_sections(
+    payload: Dict[str, Any],
+    sections: Optional[Collection[str]],
+) -> Dict[str, Any]:
+    """Return a copy of payload with only keys relevant to the given sections.
+
+    If sections is None (full report), returns the payload unchanged.
+    Used so summarize_basic_analytics only renders what was requested.
+    """
+    if sections is None:
+        return payload
+    keep: set = set()
+    for sec in sections:
+        keep.update(_SECTION_PAYLOAD_KEYS.get(sec, []))
+    return {k: v for k, v in payload.items() if k in keep}
 
 
 # ── Helper: paragraph cell ────────────────────────────────────────────────────
@@ -596,7 +655,11 @@ def build_pdf_from_text(
             flush()
             raw  = bold_m.group(1).strip()
             rest = bold_m.group(2).strip()
-            if raw.endswith(":") and rest:
+            # Fleet divider: **Fleet: FleetName** — emit banner, don't set current_title
+            if raw.startswith("Fleet:") or raw.lower().startswith("fleet:"):
+                fleet_label = raw.split(":", 1)[1].strip()
+                elements.extend(_fleet_banner(fleet_label, styles))
+            elif raw.endswith(":") and rest:
                 # Inline scalar: **Total Trips:** 150
                 kv_buf.append((raw.rstrip(":"), rest))
             else:
