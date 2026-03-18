@@ -5,11 +5,51 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
 
 logger = logging.getLogger("nlu")
+
+# ── Load metric config from JSON (edit this file to add aliases, no code change needed) ──
+_CONFIG_PATH = Path(__file__).parent / "metrics_config.json"
+_ALLOWED_ITEMS_DEFAULT = {
+    "total_trips", "total_distance_km", "sherpa_wise_trips", "sherpa_wise_distance",
+    "utilization", "uptime", "availability", "sherpa_status", "activity",
+    "takt_time", "average_takt_time", "avg_obstacle_per_sherpa", "avg_obstacle_time",
+    "obstacle_time", "top_10_routes_takt", "top_routes_takt", "route_utilization",
+    "avg_obstacle_per_route",
+}
+_METRIC_ALIASES_DEFAULT: Dict[str, str] = {
+    "tug wise distance": "sherpa_wise_distance", "tug-wise distance": "sherpa_wise_distance",
+    "bot wise distance": "sherpa_wise_distance", "bot-wise distance": "sherpa_wise_distance",
+    "robot wise distance": "sherpa_wise_distance", "per tug distance": "sherpa_wise_distance",
+    "distance per tug": "sherpa_wise_distance", "distance per sherpa": "sherpa_wise_distance",
+    "sherpa wise distance": "sherpa_wise_distance",
+    "tug wise trips": "sherpa_wise_trips", "tug-wise trips": "sherpa_wise_trips",
+    "bot wise trips": "sherpa_wise_trips", "bot-wise trips": "sherpa_wise_trips",
+    "robot wise trips": "sherpa_wise_trips", "per tug trips": "sherpa_wise_trips",
+    "trips per tug": "sherpa_wise_trips", "trips per sherpa": "sherpa_wise_trips",
+    "sherpa wise trips": "sherpa_wise_trips",
+    "tug wise": "sherpa_wise_trips", "bot wise": "sherpa_wise_trips",
+    "per bot": "sherpa_wise_trips", "per tug": "sherpa_wise_trips",
+    "route takt": "top_10_routes_takt", "takt per route": "top_10_routes_takt",
+    "top routes takt": "top_10_routes_takt", "top 10 routes takt": "top_10_routes_takt",
+    "average takt": "average_takt_time", "avg takt": "average_takt_time",
+    "route usage": "route_utilization", "obstacle count": "avg_obstacle_per_sherpa",
+    "obstacle per sherpa": "avg_obstacle_per_sherpa", "obstacle per route": "avg_obstacle_per_route",
+    "obstacle time": "avg_obstacle_time", "takt time": "takt_time",
+}
+try:
+    with _CONFIG_PATH.open() as _f:
+        _metrics_cfg = json.load(_f)
+    ALLOWED_ITEMS: set = set(_metrics_cfg["allowed_items"])
+    _METRIC_ALIASES: Dict[str, str] = _metrics_cfg["aliases"]
+except FileNotFoundError:
+    logger.warning("metrics_config.json not found at %s — using built-in defaults", _CONFIG_PATH)
+    ALLOWED_ITEMS = _ALLOWED_ITEMS_DEFAULT
+    _METRIC_ALIASES = _METRIC_ALIASES_DEFAULT
 
 
 @dataclass
@@ -22,68 +62,8 @@ class ParsedQuery:
     fleet_name: Optional[str] = None
     timezone: Optional[str] = None
     time_phrase: Optional[str] = None
+    client_from_text: bool = False  # True only when NLU found client in prompt (not from defaults)
 
-
-ALLOWED_ITEMS = {
-    "total_trips",
-    "total_distance_km",
-    "sherpa_wise_trips",
-    "sherpa_wise_distance",
-    "utilization",
-    "uptime",
-    "availability",
-    "sherpa_status",
-    "activity",
-    "takt_time",
-    "average_takt_time",
-    "avg_obstacle_per_sherpa",
-    "avg_obstacle_time",
-    "obstacle_time",
-    "top_10_routes_takt",
-    "top_routes_takt",
-    "route_utilization",
-    "avg_obstacle_per_route",
-}
-
-
-# Synonym → canonical metric mapping.
-# Checked before keyword extraction so users can say "tug wise", "bot wise", etc.
-_METRIC_ALIASES: Dict[str, str] = {
-    # sherpa_wise_distance synonyms
-    "tug wise distance":      "sherpa_wise_distance",
-    "tug-wise distance":      "sherpa_wise_distance",
-    "bot wise distance":      "sherpa_wise_distance",
-    "bot-wise distance":      "sherpa_wise_distance",
-    "robot wise distance":    "sherpa_wise_distance",
-    "per tug distance":       "sherpa_wise_distance",
-    "distance per tug":       "sherpa_wise_distance",
-    "distance per sherpa":    "sherpa_wise_distance",
-    "sherpa wise distance":   "sherpa_wise_distance",
-    # sherpa_wise_trips synonyms
-    "tug wise trips":         "sherpa_wise_trips",
-    "tug-wise trips":         "sherpa_wise_trips",
-    "bot wise trips":         "sherpa_wise_trips",
-    "bot-wise trips":         "sherpa_wise_trips",
-    "robot wise trips":       "sherpa_wise_trips",
-    "per tug trips":          "sherpa_wise_trips",
-    "trips per tug":          "sherpa_wise_trips",
-    "trips per sherpa":       "sherpa_wise_trips",
-    "sherpa wise trips":      "sherpa_wise_trips",
-    # Bare "tug wise" / "bot wise" → trips (most common ask)
-    "tug wise":               "sherpa_wise_trips",
-    "bot wise":               "sherpa_wise_trips",
-    "per bot":                "sherpa_wise_trips",
-    "per tug":                "sherpa_wise_trips",
-    # Other handy aliases
-    "route takt":             "top_10_routes_takt",
-    "takt per route":         "top_10_routes_takt",
-    "average takt":           "average_takt_time",
-    "avg takt":               "average_takt_time",
-    "route usage":            "route_utilization",
-    "obstacle count":         "avg_obstacle_per_sherpa",
-    "obstacle per sherpa":    "avg_obstacle_per_sherpa",
-    "obstacle per route":     "avg_obstacle_per_route",
-}
 
 # Keywords that terminate a client/fleet name match
 _NAME_STOP = (
@@ -125,8 +105,9 @@ def _extract_names(original_text: str) -> tuple[Optional[str], Optional[str]]:
     # ── Pattern 2: "for <UPPER-OR-HYPHEN>," or "for <NAME> <metric-word>" ───
     if not fm_client:
         # Matches: "for YOKOHAMA-DAHEJ," or "for CEAT-Nagpur uptime"
+        # Optional article (the/a/an) between "for" and the name is stripped.
         m2 = re.search(
-            r"\bfor\s+([A-Za-z][A-Za-z0-9\-]{2,}(?:\s+[A-Za-z][A-Za-z0-9\-]+)*?)"
+            r"\bfor\s+(?:the\s+|a\s+|an\s+)?([A-Za-z][A-Za-z0-9\-]{2,}(?:\s+[A-Za-z][A-Za-z0-9\-]+)*?)"
             r"(?:\s*[,.]|\s+(?:" + _NAME_STOP + r")|$)",
             original_text, re.IGNORECASE,
         )
@@ -367,6 +348,7 @@ def _heuristic_parse(text: str) -> ParsedQuery:
     sherpa = _extract_sherpa(t)
     time_phrase = _extract_time(t, original_text)
     metrics = _extract_metrics(t)
+    _from_text = bool(fm_client)  # True only when regex found a client in the prompt
 
     # ── Multi-metric ─────────────────────────────────────────────────────────
     if len(metrics) > 1:
@@ -378,6 +360,7 @@ def _heuristic_parse(text: str) -> ParsedQuery:
             fleet_name=fleet,
             sherpa_hint=sherpa,
             time_phrase=time_phrase,
+            client_from_text=_from_text,
         )
         return pq
 
@@ -391,6 +374,7 @@ def _heuristic_parse(text: str) -> ParsedQuery:
             fleet_name=fleet,
             sherpa_hint=sherpa,
             time_phrase=time_phrase,
+            client_from_text=_from_text,
         )
         if "per_sherpa" in metrics[0] or "per-sherpa" in metrics[0]:
             pq.sherpa_hint = None
@@ -404,6 +388,7 @@ def _heuristic_parse(text: str) -> ParsedQuery:
             fleet_name=fleet,
             sherpa_hint=sherpa,
             time_phrase=time_phrase,
+            client_from_text=_from_text,
         )
 
     # ── Fallback: general summary ─────────────────────────────────────────────
@@ -413,7 +398,87 @@ def _heuristic_parse(text: str) -> ParsedQuery:
         fleet_name=fleet,
         sherpa_hint=sherpa,
         time_phrase=time_phrase,
+        client_from_text=_from_text,
     )
+
+
+async def ollama_pick_client(
+    text: str,
+    known_clients: list,
+    model: Optional[str] = None,
+) -> tuple:
+    """Tier 2: Ask Ollama to identify the client from a constrained known-clients list.
+
+    Returns (exact_client_name | None, confidence_score 0–100).
+    confidence is derived by how well the picked name matches the original query
+    text — so a hallucinated pick that doesn't appear in the text gets a low score.
+    Falls back to (None, 0.0) if Ollama is unavailable or picks nothing plausible.
+    """
+    if not known_clients or not text.strip():
+        return None, 0.0
+
+    use_ollama = os.environ.get("OLLAMA_ENABLE", "1") == "1"
+    if not use_ollama:
+        return None, 0.0
+
+    _model = model or os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
+
+    prompt_str = (
+        "You are a client name extractor for a robotics fleet analytics system.\n"
+        "A user typed a query. Identify which client they are referring to.\n"
+        "IMPORTANT: You MUST pick from the provided list only, or return null.\n"
+        "Return ONLY valid JSON: {\"client\": \"<exact name from list>\"} or {\"client\": null}\n\n"
+        f"Known clients: {json.dumps(known_clients)}\n\n"
+        f"User query: {text}\n"
+    )
+
+    try:
+        obj = await _ollama_json(prompt_str, model=_model)
+        picked = obj.get("client")
+        if not picked or not isinstance(picked, str):
+            return None, 0.0
+
+        # Step 1: Find the exact match in known_clients (Ollama may alter case/spacing)
+        picked_lower = picked.strip().lower()
+        exact_match = next(
+            (n for n in known_clients if n.lower() == picked_lower), None
+        )
+
+        if not exact_match:
+            # Step 2: Fuzzy-find closest in list (handles minor Ollama edits)
+            from rapidfuzz import fuzz as _fuzz
+            best_score, best_name = 0.0, None
+            for name in known_clients:
+                s = max(
+                    _fuzz.WRatio(picked_lower, name.lower()),
+                    _fuzz.token_sort_ratio(picked_lower, name.lower()),
+                )
+                if s > best_score:
+                    best_score, best_name = s, name
+            if best_score < 85 or best_name is None:
+                logger.info("Ollama Tier-2: picked '%s' not close to any known client (best=%.1f)", picked, best_score)
+                return None, 0.0
+            exact_match = best_name
+
+        # Step 3: Validate — how much of the picked name appears in the query text?
+        # This prevents using a plausible-but-wrong pick when the name isn't in the text.
+        from rapidfuzz import fuzz as _fuzz
+        norm_pick  = re.sub(r"[-_]+", " ", exact_match).lower()
+        norm_query = re.sub(r"[-_]+", " ", text).lower()
+        confidence = max(
+            _fuzz.partial_ratio(norm_pick, norm_query),
+            _fuzz.token_set_ratio(norm_pick, norm_query),
+        )
+
+        logger.info(
+            "Ollama Tier-2 pick: '%s' → '%s' (confidence=%.1f)",
+            picked, exact_match, confidence,
+        )
+        return exact_match, float(confidence)
+
+    except Exception as exc:
+        logger.warning("ollama_pick_client failed: %s", exc)
+        return None, 0.0
 
 
 async def _ollama_json(prompt: str, model: str) -> Dict[str, Any]:
@@ -453,9 +518,9 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
     schema = {
         "intent": "basic_analytics | basic_analytics_item | multi_metric | help",
         "items": (
-            "List of metric names from ALLOWED_ITEMS. "
+            "List of canonical metric names from the allowed list. "
             "IMPORTANT: if the user asks for multiple metrics (comma- or 'and'-separated), "
-            "include ALL of them here and set intent to 'multi_metric'. "
+            "include ALL of them and set intent to 'multi_metric'. "
             "For a single metric set intent to 'basic_analytics_item'. "
             "Empty list for summary/help."
         ),
@@ -464,19 +529,29 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         "time_phrase": "string or null",
     }
 
+    # Build alias examples from config so Ollama learns every synonym
+    _alias_lines = "\n".join(
+        f'  "{phrase}" → {canonical}'
+        for phrase, canonical in _METRIC_ALIASES.items()
+    )
+
     prompt = (
         "You are a parser for a robotics analytics chatbot. "
         "Return ONLY valid JSON matching this schema: "
         f"{json.dumps(schema)}\n\n"
-        "Allowed items: "
+        "Allowed metric names (use ONLY these):\n"
         f"{sorted(ALLOWED_ITEMS)}\n\n"
+        "Metric synonyms — map user phrases to the canonical name:\n"
+        f"{_alias_lines}\n\n"
         "Examples:\n"
         '- "uptime and obstacle time" → {"intent":"multi_metric","items":["uptime","avg_obstacle_time"],...}\n'
         '- "total trips, distance and takt time" → {"intent":"multi_metric","items":["total_trips","total_distance_km","takt_time"],...}\n'
         '- "uptime" → {"intent":"basic_analytics_item","items":["uptime"],...}\n'
         '- "basic analytics" → {"intent":"basic_analytics","items":[],...}\n'
         '- "tug wise distance" or "bot wise distance" → {"intent":"basic_analytics_item","items":["sherpa_wise_distance"],...}\n'
-        '- "tug wise trips" or "bot wise" or "per tug" → {"intent":"basic_analytics_item","items":["sherpa_wise_trips"],...}\n\n'
+        '- "tug wise trips" or "bot wise" or "per tug" → {"intent":"basic_analytics_item","items":["sherpa_wise_trips"],...}\n'
+        '- "obstacle time" or "takt time" → use canonical names avg_obstacle_time / takt_time\n'
+        '- "route utilization" or "route usage" → {"intent":"basic_analytics_item","items":["route_utilization"],...}\n\n'
         "User text: "
         f"{text}\n"
     )
@@ -500,12 +575,16 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         else:
             resolved_intent = str(obj.get("intent") or "basic_analytics")
 
-        # Prefer heuristic items when they contain sherpa-wise metrics
-        # (Ollama doesn't know the "sherpa wise" → sherpa_wise_* upgrade)
+        # Safety net 1: heuristic found sherpa-wise — always trust it (alias upgrade is reliable)
         if hq.items and any("sherpa_wise" in i for i in hq.items):
             use_items = hq.items
         else:
             use_items = valid_items
+
+        # Safety net 2: if Ollama found nothing but heuristic did, use heuristic result
+        if not use_items and hq.items:
+            logger.debug("Ollama returned no items; falling back to heuristic items: %s", hq.items)
+            use_items = hq.items
 
         if len(use_items) > 1:
             resolved_intent = "multi_metric"
@@ -524,61 +603,16 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
             timezone=obj.get("timezone") or hq.timezone,
             # Prefer heuristic time (handles hour-ranges Ollama can't), fall back to Ollama
             time_phrase=hq.time_phrase or obj.get("time_phrase"),
+            # client_from_text always comes from heuristic — it reflects actual text extraction
+            client_from_text=hq.client_from_text,
         )
     except Exception as e:
         logger.warning("Ollama parse failed, falling back to heuristics: %s", e)
         pq = hq
 
-    # Post-process: Fix route analytics metrics if Ollama missed them.
-    # Skip entirely when Ollama already detected multi_metric — trust it.
-    text_lower = text.lower()
-
-    if pq.intent != "multi_metric":
-        if "obstacle" in text_lower and "time" in text_lower:
-            if pq.item not in ("avg_obstacle_per_sherpa", "avg_obstacle_time", "avg_obstacle_per_route"):
-                logger.debug("Fixing Ollama parse: detected obstacle time query")
-                pq.intent = "basic_analytics_item"
-                if "route" in text_lower or "routes" in text_lower:
-                    pq.item = "avg_obstacle_per_route"
-                elif "sherpa" in text_lower or "per sherpa" in text_lower:
-                    pq.item = "avg_obstacle_per_sherpa"
-                else:
-                    pq.item = "avg_obstacle_time"
-                pq.items = [pq.item]
-        elif "top" in text_lower and ("route" in text_lower or "routes" in text_lower) and "takt" in text_lower:
-            if pq.item not in ("top_10_routes_takt", "top_routes_takt"):
-                logger.debug("Fixing Ollama parse: detected top routes takt time query")
-                pq.intent = "basic_analytics_item"
-                pq.item = "top_10_routes_takt"
-                pq.items = [pq.item]
-        elif "route" in text_lower and "utilization" in text_lower:
-            if pq.item != "route_utilization":
-                logger.debug("Fixing Ollama parse: detected route utilization query")
-                pq.intent = "basic_analytics_item"
-                pq.item = "route_utilization"
-                pq.items = [pq.item]
-        elif ("takt" in text_lower and "time" in text_lower) or "average takt" in text_lower:
-            if pq.item not in ("takt_time", "average_takt_time"):
-                logger.debug("Fixing Ollama parse: detected takt time query")
-                pq.intent = "basic_analytics_item"
-                pq.item = "takt_time"
-                pq.items = [pq.item]
-        elif "total trips" in text_lower or ("trips" in text_lower and "total" in text_lower):
-            if pq.item != "total_trips":
-                logger.debug("Fixing Ollama parse: detected total trips query")
-                pq.intent = "basic_analytics_item"
-                pq.item = "total_trips"
-                pq.items = [pq.item]
-        elif "total distance" in text_lower or ("distance" in text_lower and "total" in text_lower):
-            if pq.item != "total_distance_km":
-                logger.debug("Fixing Ollama parse: detected total distance query")
-                pq.intent = "basic_analytics_item"
-                pq.item = "total_distance_km"
-                pq.items = [pq.item]
-
-        # Ensure items is always in sync with item for single-metric results
-        if pq.item and not pq.items:
-            pq.items = [pq.item]
+    # Ensure items is always in sync with item
+    if pq.item and not pq.items:
+        pq.items = [pq.item]
 
     # Post-process: Validate sherpa_hint - clear it if it doesn't appear in the original query
     # This prevents Ollama from hallucinating sherpa names that weren't mentioned

@@ -709,9 +709,9 @@ async def sanjaya_chat(
         recipient_email: Override REPORT_RECIPIENT for this request only
     """
     d = _defaults()
-    if client_name:
+    if client_name is not None:  # "" means "from prompt" — clears the env default
         d["fm_client_name"] = client_name
-    if fleet_name:
+    if fleet_name is not None:   # "" means "all fleets" — clears the env default
         d["fleet_name"] = fleet_name
     elif fleet_names and len(fleet_names) == 1:
         d["fleet_name"] = fleet_names[0]

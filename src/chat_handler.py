@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
-from src.nlu import parse_query
+from src.nlu import parse_query, ollama_pick_client
 from src.client_match import resolve_client, resolve_client_candidates, scan_prompt_for_client
 from src.scheduling import (
     CLIENT_REPORT_CONFIG_FILE,
@@ -50,7 +50,7 @@ def _fmt_time_header(time_strings: dict, client_name: str, fleet_name: str) -> s
     context = f"{client_name}"
     if fleet_name:
         context += f" / {fleet_name}"
-    return f"**{context}** &nbsp;|&nbsp; 📅 {_nice(start)} → {_nice(end)}\n\n---\n"
+    return f"🔍 Understood: **{context}** &nbsp;|&nbsp; 📅 {_nice(start)} → {_nice(end)}\n\n---\n"
 
 
 def _sections_for_items(items: List[str]) -> Optional[List[str]]:
@@ -416,14 +416,23 @@ async def _execute_query(
                 client_name = swap_match.get("fm_client_name")
                 fleet_name = None
 
-        # Pre-resolution prompt scan: NLU returned no client name but the user
-        # may have typed it without a 'client' keyword (e.g. "utilization for yokohoma dahej").
-        # Always ask for confirmation rather than silently picking — avoids wrong guesses.
-        if not client_name:
+        # Pre-resolution prompt scan: run when no sidebar client AND NLU didn't find a
+        # client in the prompt text (pq.fm_client_name may just be the env default).
+        # Three-threshold approach:
+        #   score >= 88 → use directly (obvious match like "tvs hosur" → TVS-Hosur)
+        #   score 78-87 → ask "Did you mean X?" confirmation
+        #   score < 78  → tell user to specify a valid client name (no silent default)
+        if not sidebar_client and not pq.client_from_text:
             scan_match, scan_score = scan_prompt_for_client(original_text, all_clients)
-            if scan_match:
+            if scan_match and scan_score >= 88:
+                # High confidence — use directly without asking
                 suggested = scan_match.get("fm_client_name")
-                logger.info("Prompt scan suggests client: '%s' (score=%.1f)", suggested, scan_score)
+                logger.info("High-confidence prompt scan: using '%s' directly (score=%.1f)", suggested, scan_score)
+                client_name = suggested
+            elif scan_match and scan_score >= 78:
+                # Medium confidence — ask for confirmation
+                suggested = scan_match.get("fm_client_name")
+                logger.info("Medium-confidence prompt scan: asking confirmation for '%s' (score=%.1f)", suggested, scan_score)
                 _save_pending_clarification(
                     missing_field="client_name_confirm",
                     partial_pq={
@@ -442,6 +451,45 @@ async def _execute_query(
                     f"Did you mean client **{suggested}**?\n\n"
                     "Reply `yes` to confirm, or type the correct client name."
                 )
+            else:
+                # Tier 2: Ollama constrained pick from known client list
+                client_names = [c.get("fm_client_name") for c in all_clients if isinstance(c, dict) and c.get("fm_client_name")]
+                ollama_pick, ollama_score = await ollama_pick_client(original_text, client_names)
+
+                if ollama_pick and ollama_score >= 88:
+                    # High confidence — use directly
+                    logger.info("Tier 2 Ollama high-confidence: '%s' (score=%.1f)", ollama_pick, ollama_score)
+                    client_name = ollama_pick
+                elif ollama_pick and ollama_score >= 78:
+                    # Medium confidence — ask confirmation
+                    logger.info("Tier 2 Ollama medium-confidence: asking '%s' (score=%.1f)", ollama_pick, ollama_score)
+                    _save_pending_clarification(
+                        missing_field="client_name_confirm",
+                        partial_pq={
+                            "intent":           pq.intent,
+                            "item":             pq.item,
+                            "items":            pq.items,
+                            "sherpa_hint":      pq.sherpa_hint,
+                            "fleet_name":       fleet_name,
+                            "timezone":         timezone,
+                            "time_phrase":      time_phrase,
+                            "original_text":    original_text,
+                            "suggested_client": ollama_pick,
+                        },
+                    )
+                    return (
+                        f"Did you mean client **{ollama_pick}**?\n\n"
+                        "Reply `yes` to confirm, or type the correct client name."
+                    )
+                else:
+                    # All tiers exhausted — tell the user
+                    examples = ", ".join(f"`{n}`" for n in sorted(client_names)[:5])
+                    return (
+                        "I couldn't identify a client name in your query. "
+                        "Please mention the client name — for example:\n\n"
+                        f"> *give me uptime for **TVS-Hosur** today*\n\n"
+                        f"Known clients (partial list): {examples}"
+                    )
 
         # Normalise client_name to exact API spelling (handles wrong case / typos)
         if client_name:

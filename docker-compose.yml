@@ -10,9 +10,10 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434'"]
-      interval: 15s
+      interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
 
   # ── MCP chat client (interactive terminal) ───────────────────────────────
   # Start with: docker compose run --rm mcp-chat
@@ -27,7 +28,7 @@ services:
       - .:/app                               # live reload: code changes apply immediately
     depends_on:
       ollama:
-        condition: service_healthy
+        condition: service_started           # don't block on health — NLU falls back to heuristics if Ollama not ready
     restart: "no"
 
   # ── MCP HTTP server (SSE transport, port 8000) ───────────────────────────
@@ -45,13 +46,14 @@ services:
       - .:/app                               # live reload: code changes apply immediately
     depends_on:
       ollama:
-        condition: service_healthy
+        condition: service_started           # mcp-server starts independently; Ollama used lazily for NLU
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8000'"]
-      interval: 10s
-      timeout: 5s
-      retries: 8
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   # ── Streamlit web UI (http://<server-ip>:8501) ────────────────────────────
   streamlit-ui:
