@@ -18,3 +18,6 @@ pytz>=2023.3
 
 # Fuzzy client/fleet name matching
 rapidfuzz>=3.0.0
+
+# AWS SES email
+boto3>=1.34.0

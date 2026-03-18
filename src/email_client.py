@@ -1,44 +1,44 @@
 """
-Email sender for CEAT-Nagpur report. Uses Gmail SMTP.
-Set in .env: EMAIL_SENDER (e.g. akshaykashyap0545@gmail.com), EMAIL_APP_PASSWORD (Gmail App Password).
+Email sender using AWS SES.
+Sender: ati.alert@atimotors.com (AUTOMATED SUPPORT no_reply)
+AWS credentials read from env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SES_REGION
 """
 
 import os
-import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
-# Load .env if python-dotenv is available
+import boto3
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "akshaykashyap0545@gmail.com")
-EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
-SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
+_EMAIL_SENDER      = "ati.alert@atimotors.com"
+_EMAIL_DISPLAY     = "AUTOMATED SUPPORT (no_reply) <ati.alert@atimotors.com>"
+_AWS_ACCESS_KEY    = os.environ.get("AWS_ACCESS_KEY_ID")
+_AWS_SECRET_KEY    = os.environ.get("AWS_SECRET_ACCESS_KEY")
+_AWS_SES_REGION    = os.environ.get("AWS_SES_REGION", "ap-south-1")
 
 
-def _get_connection():
-    if not EMAIL_APP_PASSWORD:
-        raise RuntimeError(
-            "EMAIL_APP_PASSWORD not set. Add it to .env (Gmail App Password from Google Account → Security → App passwords)."
-        )
-    server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-    server.starttls()
-    server.login(EMAIL_SENDER, EMAIL_APP_PASSWORD)
-    return server
+def _ses_client():
+    return boto3.client(
+        "ses",
+        region_name=_AWS_SES_REGION,
+        aws_access_key_id=_AWS_ACCESS_KEY,
+        aws_secret_access_key=_AWS_SECRET_KEY,
+    )
 
 
 def send_email(pdf_filename, recipients, Bcc, email_subject):
-    """Send email with PDF attachment. recipients and Bcc are lists of email addresses."""
+    """Send email with PDF attachment via SES. recipients and Bcc are lists of email addresses."""
     msg = MIMEMultipart()
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = ", ".join(recipients)
+    msg["From"]    = _EMAIL_DISPLAY
+    msg["To"]      = ", ".join(recipients)
     msg["Subject"] = email_subject
     msg.attach(MIMEText("Please find the report attached.", "plain"))
 
@@ -51,24 +51,29 @@ def send_email(pdf_filename, recipients, Bcc, email_subject):
         msg.attach(part)
 
     to_addrs = list(recipients) + list(Bcc or [])
-    server = _get_connection()
+    _ses_client().send_raw_email(
+        Source=_EMAIL_SENDER,
+        Destinations=to_addrs,
+        RawMessage={"Data": msg.as_string()},
+    )
+
     try:
-        server.sendmail(EMAIL_SENDER, to_addrs, msg.as_string())
-    finally:
-        server.quit()
+        os.remove(pdf_filename)
+    except OSError:
+        pass
 
 
 def send_email1(recipients, Bcc, message):
-    """Send plain text email (no attachment). Used when report data is empty."""
+    """Send plain text email (no attachment) via SES. Used when report data is empty."""
     msg = MIMEMultipart()
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = ", ".join(recipients)
+    msg["From"]    = _EMAIL_DISPLAY
+    msg["To"]      = ", ".join(recipients)
     msg["Subject"] = "CEAT-Nagpur Report - No Data"
     msg.attach(MIMEText(message or "No data for the report period.", "plain"))
 
     to_addrs = list(recipients) + list(Bcc or [])
-    server = _get_connection()
-    try:
-        server.sendmail(EMAIL_SENDER, to_addrs, msg.as_string())
-    finally:
-        server.quit()
+    _ses_client().send_raw_email(
+        Source=_EMAIL_SENDER,
+        Destinations=to_addrs,
+        RawMessage={"Data": msg.as_string()},
+    )
