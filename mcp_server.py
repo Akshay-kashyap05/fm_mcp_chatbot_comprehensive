@@ -711,6 +711,10 @@ async def sanjaya_chat(
     d = _defaults()
     if client_name:
         d["fm_client_name"] = client_name
+        # Sidebar selected a specific client but no fleet → clear the env default fleet
+        # so handle_chat's auto-resolution fetches all fleets for this client instead.
+        if not fleet_name and not fleet_names:
+            d["fleet_name"] = ""
     if fleet_name:
         d["fleet_name"] = fleet_name
     elif fleet_names and len(fleet_names) == 1:
