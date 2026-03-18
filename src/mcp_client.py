@@ -111,6 +111,8 @@ async def chat(
     client_name: str = "",
     fleet_name: str = "",
     fleet_names: Optional[List[str]] = None,
+    sherpa_name: str = "",
+    sherpa_names: Optional[List[str]] = None,
     time_phrase: str = "yesterday",
     timezone: str = "Asia/Kolkata",
     recipient_email: Optional[str] = None,
@@ -130,6 +132,10 @@ async def chat(
     }
     if fleet_names:
         args["fleet_names"] = fleet_names
+    if sherpa_name:
+        args["sherpa_name"] = sherpa_name
+    if sherpa_names:
+        args["sherpa_names"] = sherpa_names
     if recipient_email:
         args["recipient_email"] = recipient_email
 

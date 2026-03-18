@@ -92,11 +92,13 @@ async def _resolve_sherpa_names_for_fleet(client_name: str, fleet_name: str) -> 
 
 
 async def _fetch_analytics_data_and_summary(
-    client_name: str, fleet_name: str, time_range: str, timezone: str
+    client_name: str, fleet_name: str, time_range: str, timezone: str,
+    selected_sherpas: Optional[List[str]] = None,
 ) -> tuple[str, Dict[str, Any], Dict[str, str]]:
     return await _fetch_analytics_raw(
         client_name, fleet_name, time_range, timezone,
         api=client, client_cache=client_cache, sherpa_cache=sherpa_cache,
+        selected_sherpas=selected_sherpas,
     )
 
 
@@ -383,11 +385,13 @@ async def _get_metric_response_and_data(
     time_range: str,
     timezone: str,
     sherpa_name: Optional[str] = None,
+    selected_sherpas: Optional[List[str]] = None,
 ) -> tuple[str, Dict[str, Any], Dict[str, str]]:
     return await _get_metric_raw(
         metric, client_name, fleet_name, time_range, timezone,
         api=client, client_cache=client_cache, sherpa_cache=sherpa_cache,
         sherpa_name=sherpa_name,
+        selected_sherpas=selected_sherpas,
     )
 
 
@@ -610,9 +614,10 @@ async def _handle_multi_fleet_chat(
     fleet_names: List[str],
     time_phrase: str,
     timezone: str,
+    selected_sherpas: Optional[List[str]] = None,
 ) -> str:
     from src.nlu import parse_query as _nlu_parse
-    from src.scheduling import _save_pending_report
+    from src.scheduling import _save_pending_report, _item_to_section_names
 
     nlu_defaults = {
         "fm_client_name": "", "fleet_name": "",
@@ -623,36 +628,51 @@ async def _handle_multi_fleet_chat(
     except Exception:
         pq = None
 
-    fleet_parts, all_texts, time_strings = [], [], {}
+    fleet_parts, time_strings = [], {}
     for fleet in fleet_names:
         try:
             if pq and pq.intent == "multi_metric" and len(pq.items) > 1:
                 parts = []
                 for metric in pq.items:
                     t, _, ts = await _get_metric_response_and_data(
-                        metric, client_name, fleet, time_phrase, timezone
+                        metric, client_name, fleet, time_phrase, timezone,
+                        selected_sherpas=selected_sherpas,
                     )
                     parts.append(t)
                     time_strings = ts
                 fleet_text = "\n\n".join(parts)
             elif pq and pq.intent == "basic_analytics_item" and pq.item:
                 fleet_text, _, time_strings = await _get_metric_response_and_data(
-                    pq.item, client_name, fleet, time_phrase, timezone
+                    pq.item, client_name, fleet, time_phrase, timezone,
+                    selected_sherpas=selected_sherpas,
                 )
             else:
                 fleet_text, _, time_strings = await _fetch_analytics_data_and_summary(
-                    client_name, fleet, time_phrase, timezone
+                    client_name, fleet, time_phrase, timezone, selected_sherpas
                 )
         except Exception as e:
             fleet_text = f"Error fetching data for {fleet}: {e}"
 
-        fleet_parts.append(f"### Fleet: {fleet}\n\n{fleet_text}")
-        all_texts.append(fleet_text)
+        fleet_parts.append(f"**Fleet: {fleet}**\n\n{fleet_text}")
 
     combined = "\n\n---\n\n".join(fleet_parts)
+
+    # Compute sections from NLU result
+    if pq and pq.intent == "multi_metric" and pq.items:
+        sections: Optional[List[str]] = []
+        for item in pq.items:
+            for sec in (_item_to_section_names(item) or []):
+                if sec not in sections:
+                    sections.append(sec)
+        sections = sections or None
+    elif pq and pq.intent == "basic_analytics_item" and pq.item:
+        sections = _item_to_section_names(pq.item) or None
+    else:
+        sections = None
+
     _save_pending_report(
         client_name, ", ".join(fleet_names), time_phrase, timezone,
-        time_strings, "\n\n---\n\n".join(all_texts), text, sections=None,
+        time_strings, combined, text, sections=sections,
     )
     return combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
 
@@ -667,6 +687,8 @@ async def sanjaya_chat(
     client_name: Optional[str] = None,
     fleet_name: Optional[str] = None,
     fleet_names: Optional[List[str]] = None,
+    sherpa_name: Optional[str] = None,
+    sherpa_names: Optional[List[str]] = None,
     time_phrase: Optional[str] = None,
     timezone: Optional[str] = None,
     recipient_email: Optional[str] = None,
@@ -674,13 +696,14 @@ async def sanjaya_chat(
     """Natural language chat interface — single entry point for all queries.
 
     Handles single/multi-fleet, single/multi-metric, proceed/cancel, and scheduling.
-    Sidebar context (client, fleet, time) passed as optional params overrides env defaults.
+    Sidebar context (client, fleet, sherpa, time) passed as optional params overrides env defaults.
 
     Args:
         text:            Natural language query or control command (proceed, cancel, daily 8, …)
         client_name:     Client to query (overrides SANJAYA_DEFAULT_CLIENT env var)
         fleet_name:      Single fleet (overrides SANJAYA_DEFAULT_FLEET env var)
         fleet_names:     Multiple fleets — triggers per-fleet fan-out when 2+ provided
+        sherpa_name:     Filter to a specific sherpa (overrides NLU extraction)
         time_phrase:     Time range string (e.g. "yesterday", "last 7 days")
         timezone:        IANA timezone (e.g. "Asia/Kolkata")
         recipient_email: Override REPORT_RECIPIENT for this request only
@@ -688,10 +711,18 @@ async def sanjaya_chat(
     d = _defaults()
     if client_name:
         d["fm_client_name"] = client_name
+        # Sidebar selected a specific client but no fleet → clear the env default fleet
+        # so handle_chat's auto-resolution fetches all fleets for this client instead.
+        if not fleet_name and not fleet_names:
+            d["fleet_name"] = ""
     if fleet_name:
         d["fleet_name"] = fleet_name
     elif fleet_names and len(fleet_names) == 1:
         d["fleet_name"] = fleet_names[0]
+    if sherpa_name:
+        d["sherpa_hint"] = sherpa_name
+    if sherpa_names:
+        d["selected_sherpas"] = sherpa_names
     if time_phrase:
         d["time_phrase"] = time_phrase
     if timezone:
@@ -709,7 +740,8 @@ async def sanjaya_chat(
             resolved_time   = d.get("time_phrase", "yesterday")
             resolved_client = d.get("fm_client_name", "")
             return await _handle_multi_fleet_chat(
-                text, resolved_client, fleet_names, resolved_time, resolved_tz
+                text, resolved_client, fleet_names, resolved_time, resolved_tz,
+                selected_sherpas=d.get("selected_sherpas") or None,
             )
 
         return await handle_chat(

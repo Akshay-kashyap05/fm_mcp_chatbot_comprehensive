@@ -62,6 +62,34 @@ _DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
 
 # ── Schedule command parser ────────────────────────────────────────────────
 
+def _parse_hour(text: str) -> Optional[int]:
+    """Extract hour (0-23) from text, supporting HH:MM, Hpm/Ham, and bare integers."""
+    t = text.strip().lower()
+
+    # HH:MM format — e.g. "14:30" or "9:00"
+    hm = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
+    if hm:
+        return max(0, min(23, int(hm.group(1))))
+
+    # 12-hour am/pm — e.g. "2pm", "9am", "11 pm"
+    ampm = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
+    if ampm:
+        h = int(ampm.group(1))
+        suffix = ampm.group(2)
+        if suffix == "pm" and h != 12:
+            h += 12
+        elif suffix == "am" and h == 12:
+            h = 0
+        return max(0, min(23, h))
+
+    # Bare integer — e.g. "8", "14"
+    bare = re.search(r"\b(\d{1,2})\b", t)
+    if bare:
+        return max(0, min(23, int(bare.group(1))))
+
+    return None
+
+
 def _parse_schedule_command(text: str) -> Optional[dict]:
     """Parse a schedule preference string from the user.
 
@@ -72,14 +100,19 @@ def _parse_schedule_command(text: str) -> Optional[dict]:
       {"schedule_type": "daily",  "run_hour": int}  → every day at given hour
       {"schedule_type": "weekly", "run_hour": int, "run_day": int}
       {"error": "<message>"}                        → couldn't parse, ask again
+
+    Supported time formats:
+      - Bare hour:    daily 8   /  weekly monday 14
+      - 12-hour:      daily 2pm /  weekly friday 9am
+      - 24-hour HH:MM: daily 14:30  →  uses the hour, ignores minutes
     """
     t = text.strip().lower()
 
     if t in ("skip", "no", "no schedule", "don't schedule", "dont schedule", "none", "not now"):
         return None
 
-    hour_match = re.search(r"\b(\d{1,2})\b", t)
-    hour = max(0, min(23, int(hour_match.group(1)))) if hour_match else datetime.now().hour
+    _h = _parse_hour(t)
+    hour = _h if _h is not None else datetime.now().hour
 
     for day_name, day_idx in _DAY_MAP.items():
         if day_name in t:
@@ -97,7 +130,7 @@ def _parse_schedule_command(text: str) -> Optional[dict]:
     if re.fullmatch(r"\s*\d{1,2}\s*", t):
         return {"schedule_type": "daily", "run_hour": hour, "run_day": None}
 
-    return {"error": f"Couldn't understand '{text}'. Try: `daily 8`, `hourly`, `weekly monday 8`, or `skip`."}
+    return {"error": f"Couldn't understand '{text}'. Try: `daily 8`, `daily 2pm`, `daily 14:30`, `hourly`, `weekly monday 9am`, or `skip`."}
 
 
 # Fallback time_phrase per cadence (used only when user's query had no time range)
@@ -226,6 +259,15 @@ def _clear_pending_clarification() -> None:
 
 # ── Client report config update ───────────────────────────────────────────
 
+def _cfg_fleet_names(cfg: dict) -> list:
+    """Return fleet names from either new fleet_names (list) or legacy fleet_name (str) field."""
+    if "fleet_names" in cfg:
+        fl = cfg["fleet_names"]
+        return list(fl) if isinstance(fl, list) else ([fl] if fl else [])
+    fn = cfg.get("fleet_name", "")
+    return [fn] if fn else []
+
+
 def _add_or_update_client_config(
     client_name: str,
     fleet_name: str,
@@ -236,7 +278,12 @@ def _add_or_update_client_config(
     run_hour: Optional[int] = None,
     run_day: Optional[int] = None,
 ) -> None:
-    """Add or update an entry in client_report_config.json for Airflow scheduling."""
+    """Add or update an entry in client_report_config.json for Airflow scheduling.
+
+    Uniqueness key: (client_name, schedule_type, run_hour, run_day).
+    Multiple fleets for the same client+schedule slot are stored as a list
+    under fleet_names, so Airflow sends ONE combined report per slot.
+    """
     configs: list = []
     if os.path.isfile(CLIENT_REPORT_CONFIG_FILE):
         try:
@@ -247,30 +294,60 @@ def _add_or_update_client_config(
         except Exception:
             configs = []
 
-    new_entry: dict = {
-        "client_name": client_name,
-        "fleet_name": fleet_name,
-        "sections": sections if sections is not None else [],
-        "time_phrase": time_phrase,
-        "timezone": timezone,
-        "schedule_type": schedule_type,
-    }
-    if run_hour is not None:
-        new_entry["run_hour"] = run_hour
-    if run_day is not None:
-        new_entry["run_day"] = run_day
+    # Migrate legacy fleet_name (str) entries to fleet_names (list) on read
+    for cfg in configs:
+        if isinstance(cfg, dict) and "fleet_name" in cfg and "fleet_names" not in cfg:
+            cfg["fleet_names"] = _cfg_fleet_names(cfg)
+            cfg.pop("fleet_name", None)
+
+    def _same_slot(cfg: dict) -> bool:
+        return (
+            isinstance(cfg, dict)
+            and cfg.get("client_name", "").lower() == client_name.lower()
+            and (cfg.get("schedule_type") or "daily").lower() == schedule_type.lower()
+            and cfg.get("run_hour") == run_hour
+            and cfg.get("run_day") == run_day
+        )
 
     updated = False
     for i, cfg in enumerate(configs):
-        if (
-            isinstance(cfg, dict)
-            and cfg.get("client_name", "").lower() == client_name.lower()
-            and cfg.get("fleet_name", "").lower() == fleet_name.lower()
-        ):
-            configs[i] = new_entry
+        if _same_slot(cfg):
+            existing_fleets = _cfg_fleet_names(cfg)
+            if fleet_name not in existing_fleets:
+                existing_fleets.append(fleet_name)
+
+            existing_sections = cfg.get("sections") or []
+            if sections is not None:
+                merged_sections = list(dict.fromkeys(existing_sections + sections))
+            else:
+                merged_sections = existing_sections
+
+            configs[i] = {
+                "client_name": client_name,
+                "fleet_names": existing_fleets,
+                "sections": merged_sections,
+                "time_phrase": time_phrase,
+                "timezone": timezone,
+                "schedule_type": schedule_type,
+                **({"run_hour": run_hour} if run_hour is not None else {}),
+                **({"run_day": run_day} if run_day is not None else {}),
+            }
             updated = True
             break
+
     if not updated:
+        new_entry: dict = {
+            "client_name": client_name,
+            "fleet_names": [fleet_name],
+            "sections": sections if sections is not None else [],
+            "time_phrase": time_phrase,
+            "timezone": timezone,
+            "schedule_type": schedule_type,
+        }
+        if run_hour is not None:
+            new_entry["run_hour"] = run_hour
+        if run_day is not None:
+            new_entry["run_day"] = run_day
         configs.append(new_entry)
 
     with open(CLIENT_REPORT_CONFIG_FILE, "w", encoding="utf-8") as f:

@@ -97,6 +97,16 @@ def summarize_basic_analytics(payload: Dict[str, Any]) -> str:
             rows.append([r.get("sherpa_name", "?"), f"{dist:.2f}" if isinstance(dist, float) else str(dist)])
         sections.append("**Distance by Sherpa (km)**\n" + _md_table(["Sherpa", "Distance (km)"], rows))
 
+    # ── Uptime ────────────────────────────────────────────────────────────────
+    upt = payload.get("uptime") or []
+    if upt:
+        rows = [
+            [r.get("sherpa_name", "?"),
+             f"{r.get('uptime_percentage') or r.get('uptime', 0):.1f}%"]
+            for r in upt
+        ]
+        sections.append("**Uptime**\n" + _md_table(["Sherpa", "Uptime"], rows))
+
     # ── Avg Takt Time per Sherpa ──────────────────────────────────────────────
     takt = payload.get("avg_takt_per_sherpa") or []
     if takt:
@@ -113,6 +123,45 @@ def summarize_basic_analytics(payload: Dict[str, Any]) -> str:
             "**Avg Takt Time per Sherpa (min)**\n"
             + _md_table(["Sherpa", "Avg", "Min", "Max", "Trips"], rows)
         )
+
+    # ── Avg Obstacle Time per Sherpa ──────────────────────────────────────────
+    obs_sherpa = payload.get("avg_obstacle_per_sherpa") or []
+    if obs_sherpa:
+        rows = [
+            [r.get("sherpa_name", "?"), f"{r.get('avg_obstacle_time_min', 0):.2f}"]
+            for r in sorted(obs_sherpa, key=lambda x: x.get("avg_obstacle_time_min", 0), reverse=True)
+        ]
+        sections.append("**Avg Obstacle Time per Sherpa (min)**\n" + _md_table(["Sherpa", "Avg Obstacle (min)"], rows))
+
+    # ── Top Routes by Takt Time ───────────────────────────────────────────────
+    top_routes = payload.get("top_10_routes_takt") or []
+    if top_routes:
+        rows = []
+        for r in top_routes[:10]:
+            route = r.get("route", [])
+            route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+            rows.append([route_str, f"{r.get('avg_takt_time_minutes', 0):.2f}"])
+        sections.append("**Top Routes by Takt Time (min)**\n" + _md_table(["Route", "Avg Takt (min)"], rows))
+
+    # ── Route Utilization ─────────────────────────────────────────────────────
+    route_util = payload.get("route_utilization") or []
+    if route_util:
+        rows = []
+        for r in sorted(route_util, key=lambda x: x.get("utilization", 0), reverse=True):
+            route = r.get("route", [])
+            route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+            rows.append([route_str, f"{r.get('utilization', 0):.2f}%"])
+        sections.append("**Route Utilization**\n" + _md_table(["Route", "Utilization"], rows))
+
+    # ── Avg Obstacle Time per Route ───────────────────────────────────────────
+    obs_route = payload.get("avg_obstacle_per_route") or []
+    if obs_route:
+        rows = []
+        for r in sorted(obs_route, key=lambda x: x.get("avg_obstacle_time_min", 0), reverse=True):
+            route = r.get("route", [])
+            route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+            rows.append([route_str, f"{r.get('avg_obstacle_time_min', 0):.2f}"])
+        sections.append("**Avg Obstacle Time per Route (min)**\n" + _md_table(["Route", "Avg Obstacle (min)"], rows))
 
     return "\n\n".join(sections) if sections else "No data available."
 
@@ -302,7 +351,7 @@ def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional
             for entry in entries[:10]:  # Already top 10, but limit to be safe
                 route = entry.get("route", [])
                 avg_takt = entry.get("avg_takt_time_minutes", 0)
-                route_str = " → ".join(route) if isinstance(route, list) else str(route)
+                route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
                 formatted_lines.append(f"{route_str}: {avg_takt:.2f} min")
             return "\n".join(formatted_lines), note
         return "No route takt time data available.", note
@@ -315,8 +364,9 @@ def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional
             for entry in sorted(entries, key=lambda x: x.get("utilization", 0), reverse=True):
                 route = entry.get("route", [])
                 utilization = entry.get("utilization", 0)
-                route_str = " → ".join(route) if isinstance(route, list) else str(route)
-                formatted_lines.append(f"{route_str}: {utilization:.2f}%")
+                route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+                label = route_str if route_str else entry.get("sherpa_name") or entry.get("sherpa", "(unknown)")
+                formatted_lines.append(f"{label}: {utilization:.2f}%")
             return "\n".join(formatted_lines), note
         return "No route utilization data available.", note
 
@@ -328,10 +378,54 @@ def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional
             for entry in sorted(entries, key=lambda x: x.get("avg_obstacle_time_min", 0), reverse=True):
                 route = entry.get("route", [])
                 obstacle_time = entry.get("avg_obstacle_time_min", 0)
-                route_str = " → ".join(route) if isinstance(route, list) else str(route)
-                formatted_lines.append(f"{route_str}: {obstacle_time:.2f} min")
+                route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+                label = route_str if route_str else entry.get("sherpa_name") or entry.get("sherpa", "(unknown)")
+                formatted_lines.append(f"{label}: {obstacle_time:.2f} min")
             return "\n".join(formatted_lines), note
         return "No obstacle time per route data available.", note
+
+    # Generic route analytics — return combined summary of all route sub-sections
+    if item in ("route_analytics",):
+        parts = []
+        # Takt time per sherpa
+        takt = payload.get("avg_takt_per_sherpa") or []
+        if takt:
+            lines = []
+            for r in sorted(takt, key=lambda x: x.get("avg_takt_time_minutes", 0), reverse=True)[:10]:
+                sherpa = r.get("sherpa", "?")
+                lines.append(f"{sherpa}: {r.get('avg_takt_time_minutes', 0):.2f} min "
+                              f"(min: {r.get('min_takt_time_minutes', 0):.2f}, "
+                              f"max: {r.get('max_takt_time_minutes', 0):.2f}), "
+                              f"{r.get('total_trips', 0)} trips")
+            parts.append("**Takt Time per Sherpa**\n" + "\n".join(lines))
+        # Route utilization
+        ru = payload.get("route_utilization") or []
+        if ru:
+            lines = []
+            for r in sorted(ru, key=lambda x: x.get("utilization", 0), reverse=True)[:10]:
+                route = r.get("route", [])
+                route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+                lines.append(f"{route_str or '(unknown route)'}: {r.get('utilization', 0):.2f}%")
+            parts.append("**Route Utilization**\n" + "\n".join(lines))
+        # Top routes by takt
+        top = payload.get("top_10_routes_takt") or []
+        if top:
+            lines = []
+            for r in top[:10]:
+                route = r.get("route", [])
+                route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+                lines.append(f"{route_str}: {r.get('avg_takt_time_minutes', 0):.2f} min")
+            parts.append("**Top Routes by Takt Time**\n" + "\n".join(lines))
+        # Obstacle per route
+        opr = payload.get("avg_obstacle_per_route") or []
+        if opr:
+            lines = []
+            for r in sorted(opr, key=lambda x: x.get("avg_obstacle_time_min", 0), reverse=True)[:10]:
+                route = r.get("route", [])
+                route_str = " → ".join(str(s) for s in route) if isinstance(route, list) else str(route)
+                lines.append(f"{route_str or '(unknown route)'}: {r.get('avg_obstacle_time_min', 0):.2f} min")
+            parts.append("**Avg Obstacle Time per Route**\n" + "\n".join(lines))
+        return "\n\n".join(parts) if parts else "No route analytics data available.", note
 
     # default fallback
     return payload.get(item), note

@@ -53,6 +53,21 @@ def _fmt_time_header(time_strings: dict, client_name: str, fleet_name: str) -> s
     return f"**{context}** &nbsp;|&nbsp; 📅 {_nice(start)} → {_nice(end)}\n\n---\n"
 
 
+def _sections_for_items(items: List[str]) -> Optional[List[str]]:
+    """Return deduplicated section list for a list of metric items.
+    Returns None only when items is empty (= full report)."""
+    if not items:
+        return None
+    result: List[str] = []
+    for item in items:
+        s = _item_to_section_names(item)
+        if s:
+            for sec in s:
+                if sec not in result:
+                    result.append(sec)
+    return result if result else None
+
+
 _SCHEDULE_WORDS = {"daily", "weekly", "hourly", "skip", "every", "monday", "tuesday",
                    "wednesday", "thursday", "friday", "saturday", "sunday"}
 _ANALYTICS_WORDS = {
@@ -108,9 +123,14 @@ async def handle_chat(
     # ── Pending clarification: user is answering a question we asked ───────
     # e.g. we asked "which client?" and user replied "YOKOHAMA-DAHEJ"
     pending_clarif = _load_pending_clarification()
-    if pending_clarif and _looks_like_new_query(text):
-        # User typed a brand-new analytics query — discard stale clarification state
-        logger.info("Stale pending_clarification detected; clearing and processing as new query.")
+    _GLOBAL_CTRL = {
+        "proceed", "yes", "confirm", "send", "proceed to email",
+        "cancel", "no", "skip",
+    }
+    if pending_clarif and (text.strip().lower() in _GLOBAL_CTRL or _looks_like_new_query(text)):
+        # Control commands (proceed/cancel/schedule) and new analytics queries
+        # always override a stale pending clarification.
+        logger.info("Clearing pending_clarification: text=%r is a control cmd or new query.", text)
         _clear_pending_clarification()
         pending_clarif = None
     if pending_clarif:
@@ -187,11 +207,12 @@ async def handle_chat(
             return (
                 f"PDF report sent to {recipient}.\n\n"
                 "**How would you like to schedule this report?**\n"
-                "- `daily 8` — every day at 08:00\n"
-                "- `daily` — every day at the same hour as now\n"
+                "- `daily 8` or `daily 8am` — every day at 08:00\n"
+                "- `daily 14:30` — every day at 14:00 (minutes ignored, hour used)\n"
+                "- `daily 2pm` — every day at 14:00\n"
                 "- `hourly` — every hour\n"
                 "- `every 20 mins` — every 20 minutes (for testing)\n"
-                "- `weekly monday 8` — every Monday at 08:00\n"
+                "- `weekly monday 9am` — every Monday at 09:00\n"
                 "- `skip` — don't schedule (one-time send only)\n"
             )
         except Exception as e:
@@ -222,7 +243,7 @@ async def handle_chat(
             if _looks_like_new_query(text):
                 logger.info("Stale pending_schedule detected; message looks like a new query — clearing state.")
                 _clear_pending_schedule()
-                # Fall through to the main NLU block below
+                # Fall through to the main NLU block below (skip the rest of if pending_sched block)
             else:
                 return (
                     schedule["error"] + "\n\n"
@@ -233,54 +254,59 @@ async def handle_chat(
                     "- `weekly monday 8` — every Monday at 08:00\n"
                     "- `skip` — no scheduling\n"
                 )
+        else:
+            sched_type = schedule["schedule_type"]
+            time_phrase = pending_sched.get("time_phrase") or _SCHEDULE_TIME_PHRASE.get(sched_type, "yesterday")
+            try:
+                # fleet_name may be comma-joined (multi-fleet) — create one entry per fleet
+                raw_fleet = pending_sched.get("fleet_name", "")
+                fleet_list = [f.strip() for f in raw_fleet.split(",") if f.strip()]
+                for fl in fleet_list:
+                    _add_or_update_client_config(
+                        client_name=pending_sched["client_name"],
+                        fleet_name=fl,
+                        time_phrase=time_phrase,
+                        timezone=pending_sched.get("timezone", "Asia/Kolkata"),
+                        sections=pending_sched.get("sections"),
+                        schedule_type=sched_type,
+                        run_hour=schedule.get("run_hour"),
+                        run_day=schedule.get("run_day"),
+                    )
+                _clear_pending_schedule()
 
-        sched_type = schedule["schedule_type"]
-        time_phrase = pending_sched.get("time_phrase") or _SCHEDULE_TIME_PHRASE.get(sched_type, "yesterday")
-        try:
-            _add_or_update_client_config(
-                client_name=pending_sched["client_name"],
-                fleet_name=pending_sched["fleet_name"],
-                time_phrase=time_phrase,
-                timezone=pending_sched.get("timezone", "Asia/Kolkata"),
-                sections=pending_sched.get("sections"),
-                schedule_type=sched_type,
-                run_hour=schedule.get("run_hour"),
-                run_day=schedule.get("run_day"),
-            )
-            _clear_pending_schedule()
+                if sched_type == "every_20min":
+                    cadence_desc = "every 20 minutes [testing mode]"
+                elif sched_type == "hourly":
+                    cadence_desc = "every hour"
+                elif sched_type == "daily":
+                    h = schedule.get("run_hour", datetime.now().hour)
+                    cadence_desc = f"every day at {h:02d}:00"
+                else:
+                    day_label = _DAY_NAMES[schedule.get("run_day", 0)]
+                    h = schedule.get("run_hour", datetime.now().hour)
+                    cadence_desc = f"every {day_label} at {h:02d}:00"
+                sched_desc = f"{cadence_desc} (data: {time_phrase})"
 
-            if sched_type == "every_20min":
-                cadence_desc = "every 20 minutes [testing mode]"
-            elif sched_type == "hourly":
-                cadence_desc = "every hour"
-            elif sched_type == "daily":
-                h = schedule.get("run_hour", datetime.now().hour)
-                cadence_desc = f"every day at {h:02d}:00"
-            else:
-                day_label = _DAY_NAMES[schedule.get("run_day", 0)]
-                h = schedule.get("run_hour", datetime.now().hour)
-                cadence_desc = f"every {day_label} at {h:02d}:00"
-            sched_desc = f"{cadence_desc} (data: {time_phrase})"
-
-            return (
-                f"Scheduled! Airflow will deliver this report **{sched_desc}**.\n\n"
-                f"The `client_report_config.json` has been updated — "
-                f"you can change or remove the entry there at any time."
-            )
-        except Exception as e:
-            logger.warning("Failed to write schedule config: %s", e)
-            return f"Failed to save schedule: {e}"
+                fleet_label = raw_fleet if len(fleet_list) == 1 else ", ".join(fleet_list)
+                return (
+                    f"Scheduled! Airflow will deliver the report for **{fleet_label}** **{sched_desc}**.\n\n"
+                    f"The `client_report_config.json` has been updated — "
+                    f"you can change or remove the entries there at any time."
+                )
+            except Exception as e:
+                logger.warning("Failed to write schedule config: %s", e)
+                return f"Failed to save schedule: {e}"
 
     # ── Main query ────────────────────────────────────────────────────────
     try:
         clean_text = text.replace("[sherpa:all]", "").strip()
-        empty_defaults = {
-            "fm_client_name": "",
-            "fleet_name": "",
-            "timezone": defaults.get("timezone", "Asia/Kolkata"),
-            "time_phrase": defaults.get("time_phrase", "today"),
+        effective_defaults = {
+            "fm_client_name": defaults.get("fm_client_name", ""),
+            "fleet_name":     defaults.get("fleet_name", ""),
+            "timezone":       defaults.get("timezone", "Asia/Kolkata"),
+            "time_phrase":    defaults.get("time_phrase", "today"),
         }
-        pq = await parse_query(clean_text, defaults=empty_defaults)
+        pq = await parse_query(clean_text, defaults=effective_defaults)
 
         t_lower = clean_text.lower()
 
@@ -360,13 +386,16 @@ async def _execute_query(
 ) -> str:
     """Resolve names, validate required fields (asking user if missing), then fetch data."""
 
-    # Prompt-first mode: client and fleet MUST come from NLU (the user's prompt).
-    # We do NOT fall back to env defaults for those — if they're missing we ask.
-    # Timezone is safe to default (user rarely types it). Time phrase we ask for if absent.
-    client_from_nlu = bool(pq.fm_client_name)
-    client_name = pq.fm_client_name or None          # never use env default for client
-    fleet_name  = pq.fleet_name or None              # never use env default for fleet
-    time_phrase = pq.time_phrase or defaults.get("time_phrase") or None   # ask if still None
+    # Dropdown priority: if sidebar provided a value, it overrides NLU.
+    # NLU is the fallback when the dropdown is empty/unselected.
+    sidebar_client = defaults.get("fm_client_name", "")
+    sidebar_fleet  = defaults.get("fleet_name", "")
+    sidebar_time   = defaults.get("time_phrase", "")
+
+    client_from_nlu = bool(sidebar_client) or bool(pq.fm_client_name)
+    client_name = sidebar_client or pq.fm_client_name or None
+    fleet_name  = sidebar_fleet  or pq.fleet_name  or None
+    time_phrase = sidebar_time   or pq.time_phrase  or None
     timezone    = pq.timezone
     if not timezone or str(timezone).lower() in ("null", "none", ""):
         timezone = defaults.get("timezone") or "Asia/Kolkata"
@@ -575,9 +604,14 @@ async def _execute_query(
         except Exception as e:
             logger.warning("Fleet auto-resolve failed: %s", e)
 
-    api_sherpa_name = pq.sherpa_hint
+    # Dropdown priority for sherpa — sidebar selection overrides NLU
+    sidebar_sherpa  = defaults.get("sherpa_hint", "")
+    api_sherpa_name = sidebar_sherpa or pq.sherpa_hint
     if isinstance(api_sherpa_name, str) and api_sherpa_name.lower() in ("null", "none", ""):
         api_sherpa_name = None
+
+    # Multi-sherpa list from dropdown (for full analytics filtering)
+    selected_sherpas: Optional[List[str]] = defaults.get("selected_sherpas") or None
 
     # ── All-fleets mode: no fleet specified, query each fleet and combine ──
     fleets_to_query: List[str] = [fleet_name] if fleet_name else all_fleet_names
@@ -598,6 +632,7 @@ async def _execute_query(
                         resp, _, ts = await get_metric_data_fn(
                             metric=metric, client_name=client_name, fleet_name=fl,
                             time_range=time_phrase, timezone=timezone, sherpa_name=api_sherpa_name,
+                            selected_sherpas=selected_sherpas,
                         )
                         metric_parts.append(resp)
                         time_strings = ts
@@ -606,13 +641,17 @@ async def _execute_query(
                     resp, _, ts = await get_metric_data_fn(
                         metric=pq.item, client_name=client_name, fleet_name=fl,
                         time_range=time_phrase, timezone=timezone, sherpa_name=api_sherpa_name,
+                        selected_sherpas=selected_sherpas,
                     )
                     time_strings = ts
                     fleet_parts.append(f"**Fleet: {fl}**\n\n{resp}")
                 else:
-                    resp, _, ts = await fetch_analytics_fn(client_name, fl, time_phrase, timezone)
+                    resp, _, ts = await fetch_analytics_fn(client_name, fl, time_phrase, timezone, selected_sherpas)
                     time_strings = ts
-                    fleet_parts.append(resp)
+                    # Strip "Analytics Summary for X (Y):\n\n" wrapper — fleet banner replaces it
+                    if resp.startswith("Analytics Summary for "):
+                        resp = resp[resp.find("\n\n") + 2:].strip() if "\n\n" in resp else resp
+                    fleet_parts.append(f"**Fleet: {fl}**\n\n{resp}")
             except Exception as e:
                 logger.warning("Failed to fetch data for fleet %s: %s", fl, e)
                 fleet_parts.append(f"**Fleet: {fl}** — data unavailable ({e})")
@@ -621,7 +660,8 @@ async def _execute_query(
         header = _fmt_time_header(time_strings, client_name, "all fleets")
         _save_pending_report(
             client_name, ", ".join(fleets_to_query), time_phrase, timezone,
-            time_strings, combined, original_text, sections=None,
+            time_strings, combined, original_text,
+            sections=_sections_for_items(pq.items if pq.intent == "multi_metric" else ([pq.item] if pq.item else [])),
         )
         return header + combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
 
@@ -639,6 +679,7 @@ async def _execute_query(
                 time_range=time_phrase,
                 timezone=timezone,
                 sherpa_name=api_sherpa_name,
+                selected_sherpas=selected_sherpas,
             )
             parts.append(metric_response)
             time_strings = ts
@@ -646,7 +687,8 @@ async def _execute_query(
         header = _fmt_time_header(time_strings, client_name, fleet_name)
         _save_pending_report(
             client_name, fleet_name, time_phrase, timezone,
-            time_strings, combined, original_text, sections=None,
+            time_strings, combined, original_text,
+            sections=_sections_for_items(pq.items),
         )
         return header + combined + "\n\n---\nType **proceed** to email this as a PDF report, or **cancel** to skip."
 
@@ -659,6 +701,7 @@ async def _execute_query(
             time_range=time_phrase,
             timezone=timezone,
             sherpa_name=api_sherpa_name,
+            selected_sherpas=selected_sherpas,
         )
         header = _fmt_time_header(time_strings, client_name, fleet_name)
         _save_pending_report(
@@ -671,7 +714,7 @@ async def _execute_query(
     # ── Full analytics summary ────────────────────────────────────────
     else:
         summary_text, data, time_strings = await fetch_analytics_fn(
-            client_name, fleet_name, time_phrase, timezone
+            client_name, fleet_name, time_phrase, timezone, selected_sherpas
         )
         header = _fmt_time_header(time_strings, client_name, fleet_name)
         _save_pending_report(
