@@ -287,6 +287,15 @@ async def get_metric_response_and_data(
         else (api_sherpa_name if isinstance(api_sherpa_name, str) else None)
     )
     val, note = extract_item_value(data, item=metric, sherpa_hint=extraction_sherpa_hint)
+
+    # Post-filter: if specific sherpas were selected, drop any unselected entries
+    if selected_sherpas and isinstance(val, list) and val and isinstance(val[0], dict):
+        selected_lower = {s.lower() for s in selected_sherpas}
+        val = [
+            entry for entry in val
+            if (entry.get("sherpa_name") or entry.get("sherpa", "")).lower() in selected_lower
+        ]
+
     result = format_metric_value(metric, val, note, use_markdown=use_markdown)
     return result, data, time_strings
 
