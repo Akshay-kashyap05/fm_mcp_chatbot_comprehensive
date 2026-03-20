@@ -717,11 +717,13 @@ def send_report_email(
     subject: str,
     report_dir: str | None = None,
     recipients: Optional[List[str]] = None,
+    cc_recipients: Optional[List[str]] = None,
 ) -> None:
     """Send PDF report to recipients via SMTP, then delete the temporary file."""
     to = _parse_recipients(recipients)
+    cc = [e.strip() for e in cc_recipients if e.strip()] if cc_recipients else []
     try:
-        _send_email(pdf_path, to, [], subject)
+        _send_email(pdf_path, to, [], subject, cc=cc)
     finally:
         try:
             os.remove(pdf_path)

@@ -221,7 +221,17 @@ def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional
         return payload.get("total_trips"), note
 
     # Direct top-level keys (for items that don't have sherpa-wise breakdowns)
-    if item in payload and sherpa_hint is None:
+    # Exclude route-analytics items that need their own handlers below (they return
+    # lists of dicts keyed on "route", not "sherpa_name", and would render as "Unknown"
+    # if allowed to fall through to format_metric_value's generic sherpa-table path).
+    _NEEDS_ROUTE_HANDLER = {
+        "takt_time", "average_takt_time",
+        "avg_obstacle_per_sherpa", "avg_obstacle_time", "obstacle_time",
+        "top_10_routes_takt", "top_routes_takt",
+        "route_utilization",
+        "avg_obstacle_per_route",
+    }
+    if item in payload and sherpa_hint is None and item not in _NEEDS_ROUTE_HANDLER:
         return payload.get(item), note
 
     # Normalized mapping for common queries
@@ -382,7 +392,7 @@ def extract_item_value(payload: Dict[str, Any], item: str, sherpa_hint: Optional
                 label = route_str if route_str else entry.get("sherpa_name") or entry.get("sherpa", "(unknown)")
                 formatted_lines.append(f"{label}: {obstacle_time:.2f} min")
             return "\n".join(formatted_lines), note
-        return "No obstacle time per route data available.", note
+        return "Not currently available — no obstacle-per-route data in your system yet.", note
 
     # Generic route analytics — return combined summary of all route sub-sections
     if item in ("route_analytics",):

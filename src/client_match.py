@@ -369,3 +369,92 @@ def scan_prompt_for_client(
         best_score,
     )
     return None, 0.0
+
+
+def scan_prompt_for_client_candidates(
+    prompt_text: str,
+    all_clients: List[Dict],
+    min_score: int = PROMPT_SCAN_MIN_SCORE,
+    max_ngram: int = 4,
+    ambiguity_gap: int = 10,
+) -> List[Tuple[Dict, float]]:
+    """Like scan_prompt_for_client but returns ALL candidates near the best score.
+
+    Use this to detect ambiguity: e.g. "schneider electric" matching both
+    "Schneider Electric-Chino" and "Schneider Electric-Chennai" at similar scores.
+
+    Parameters
+    ----------
+    ambiguity_gap : int
+        Candidates within this many points of the best score are returned.
+        Candidates more than ``ambiguity_gap`` points below the best are dropped.
+
+    Returns
+    -------
+    List of (client_dict, score) sorted by score descending.
+    Empty list if nothing meets min_score.
+    """
+    if not prompt_text or not all_clients:
+        return []
+
+    name_map: Dict[str, Dict] = {}
+    for c in all_clients:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("fm_client_name") or ""
+        if name:
+            name_map[name.lower()] = c
+
+    if not name_map:
+        return []
+
+    words = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9\-]*", prompt_text)
+    _STOP = {
+        "for", "the", "a", "an", "of", "in", "at", "to", "on", "by",
+        "with", "and", "or", "is", "are", "was", "were", "get", "show",
+        "give", "what", "which", "how", "tell", "me", "us", "all", "fleet",
+        "client", "today", "yesterday", "this", "last", "week", "month",
+        "year", "time", "date", "report", "summary", "analytics", "data",
+        "basic", "uptime", "trips", "distance", "utilization", "status",
+        "sherpa", "tug", "route",
+    }
+
+    # Accumulate best score per client across all n-grams + full prompt
+    best_per_client: Dict[str, float] = {}
+
+    prompt_norm = _normalize(prompt_text)
+    for raw_name in name_map:
+        s = _best_score(prompt_norm, _normalize(raw_name))
+        if s >= min_score:
+            best_per_client[raw_name] = max(best_per_client.get(raw_name, 0.0), s)
+
+    for n in range(1, max_ngram + 1):
+        for i in range(len(words) - n + 1):
+            ngram = " ".join(words[i: i + n]).lower()
+            if all(w in _STOP for w in ngram.split()):
+                continue
+            if n == 1 and len(ngram) < 3:
+                continue
+            ngram_norm = _normalize(ngram)
+            for raw_name in name_map:
+                s = _best_score(ngram_norm, _normalize(raw_name))
+                if s >= min_score:
+                    best_per_client[raw_name] = max(best_per_client.get(raw_name, 0.0), s)
+
+    if not best_per_client:
+        return []
+
+    overall_best = max(best_per_client.values())
+    candidates = [
+        (name_map[raw], score)
+        for raw, score in best_per_client.items()
+        if score >= overall_best - ambiguity_gap
+    ]
+    candidates.sort(key=lambda x: -x[1])
+
+    logger.info(
+        "Prompt scan candidates for '%s': %s",
+        prompt_text,
+        [(d.get("fm_client_name"), round(s, 1)) for d, s in candidates],
+    )
+    return candidates

@@ -194,6 +194,8 @@ def _get_chat_state() -> str:
         return "awaiting_proceed"
     if "how would you like to schedule" in content:
         return "awaiting_schedule"
+    if "who should receive this report" in content:
+        return "awaiting_email_recipients"
     return "idle"
 
 
@@ -219,7 +221,7 @@ def _process_message(
     # Control commands AND schedule commands must NOT carry fleet_names.
     # sanjaya_chat routes on len(fleet_names) > 1 BEFORE checking the command,
     # which causes multi-fleet analytics re-run instead of email send / schedule.
-    _sched_prefixes = ("daily", "hourly", "weekly", "every 20", "every hour")
+    _sched_prefixes = ("daily", "hourly", "weekly", "every 20", "every hour", "to:", "cc:")
     _p = prompt.strip().lower()
     is_ctrl = _p in _CONTROL_CMDS or any(_p.startswith(kw) for kw in _sched_prefixes)
     return _run(mcp_client.chat(
@@ -280,6 +282,8 @@ def _handle_pending_actions() -> None:
         cmd, email, label = "cancel", None, "❌ Cancel"
     elif action_type == "schedule":
         cmd, email, label = action_value, None, f"⏰ {action_value}"
+    elif action_type == "email_recipients":
+        cmd, email, label = action_value, None, "📧 Recipients confirmed"
     elif action_type == "quick_query":
         # Quick buttons skip confirmation — execute immediately
         st.session_state.messages.append({"role": "user", "content": action_value})
@@ -552,6 +556,8 @@ def _build_confirmation_text(c: dict) -> str:
     parts = [metric_text]
     if client:
         parts.append(f"for {client}")
+    else:
+        parts.append("(client — will detect from prompt)")
     if fleet:
         parts.append(f"/ {fleet}")
     if sherpa:
@@ -749,6 +755,48 @@ def main():
             if st.button("Set custom schedule", key="sched_custom_btn", use_container_width=True):
                 if custom_sched.strip():
                     st.session_state.pending_action = ("schedule", custom_sched.strip())
+                    st.rerun()
+
+    elif chat_state == "awaiting_email_recipients":
+        st.divider()
+        with st.container(border=True):
+            st.markdown("**📧 Who should receive this scheduled report?**")
+            default_email = os.environ.get("REPORT_RECIPIENT", "")
+
+            to_input = st.text_input(
+                "To *(required)*",
+                value=st.session_state.get("recipient_email") or default_email,
+                placeholder="manager@company.com, analyst@company.com",
+                help="One or more email addresses separated by commas",
+                key="sched_to_input",
+            )
+            cc_input = st.text_input(
+                "CC *(optional)*",
+                value="",
+                placeholder="boss@company.com, team@company.com",
+                help="Optional CC recipients — leave blank if not needed",
+                key="sched_cc_input",
+            )
+            if default_email:
+                st.caption(f"Default from `.env`: **{default_email}**")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Confirm Recipients", type="primary", use_container_width=True):
+                    to_clean  = to_input.strip()
+                    cc_clean  = cc_input.strip()
+                    if to_clean:
+                        cmd = f"to: {to_clean}"
+                        if cc_clean:
+                            cmd += f" cc: {cc_clean}"
+                    else:
+                        cmd = "skip"
+                    st.session_state.recipient_email = to_clean
+                    st.session_state.pending_action  = ("email_recipients", cmd)
+                    st.rerun()
+            with col2:
+                if st.button("Skip (use default)", use_container_width=True, key="sched_skip_btn"):
+                    st.session_state.pending_action = ("email_recipients", "skip")
                     st.rerun()
 
     else:
