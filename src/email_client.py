@@ -36,7 +36,7 @@ def _ses_client():
     )
 
 
-def send_email(pdf_filename, recipients, Bcc, email_subject):
+def send_email(pdf_filename, recipients, Bcc, email_subject, cc=None):
     """Send email with PDF attachment via AWS SES.
 
     Parameters
@@ -45,11 +45,14 @@ def send_email(pdf_filename, recipients, Bcc, email_subject):
     recipients   : list  Primary To: recipients.
     Bcc          : list  BCC recipients (included in Destinations, hidden from To).
     email_subject: str   Subject line.
+    cc           : list  CC recipients (visible in email headers).
     """
     msg = MIMEMultipart()
     msg["From"]    = _EMAIL_DISPLAY
     msg["To"]      = ", ".join(recipients)
     msg["Subject"] = email_subject
+    if cc:
+        msg["Cc"] = ", ".join(cc)
     msg.attach(MIMEText("Please find the report attached.", "plain"))
 
     if os.path.isfile(pdf_filename):
@@ -63,7 +66,7 @@ def send_email(pdf_filename, recipients, Bcc, email_subject):
         )
         msg.attach(part)
 
-    all_destinations = list(recipients) + list(Bcc or [])
+    all_destinations = list(recipients) + list(cc or []) + list(Bcc or [])
     _ses_client().send_raw_email(
         Source=_EMAIL_SENDER,
         Destinations=all_destinations,

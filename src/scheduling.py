@@ -257,6 +257,39 @@ def _clear_pending_clarification() -> None:
         pass
 
 
+# ── Email recipient parser ────────────────────────────────────────────────
+
+def _parse_email_recipients(text: str) -> dict:
+    """Parse a user's email reply into To and CC lists.
+
+    Supported formats
+    -----------------
+    "a@b.com"                                      → to: [a@b.com], cc: []
+    "a@b.com, c@d.com"                             → to: [a@b.com, c@d.com], cc: []
+    "to: a@b.com cc: x@y.com"                      → to: [a@b.com], cc: [x@y.com]
+    "to: a@b.com, b@b.com cc: x@y.com, z@y.com"   → multiple per field
+    "skip"                                         → to: [], cc: []
+    """
+    text = text.strip()
+    if text.lower() in ("skip", "none", "no", ""):
+        return {"to_emails": [], "cc_emails": []}
+
+    to_match = re.search(r"(?i)\bto\s*:\s*(.+?)(?=\bcc\s*:|\Z)", text)
+    cc_match  = re.search(r"(?i)\bcc\s*:\s*(.+?)(?=\bto\s*:|\Z)", text)
+
+    if to_match or cc_match:
+        to_part  = to_match.group(1).strip() if to_match else ""
+        cc_part  = cc_match.group(1).strip()  if cc_match  else ""
+        to_emails = [e.strip() for e in re.split(r"[,;]+", to_part) if e.strip() and "@" in e]
+        cc_emails = [e.strip() for e in re.split(r"[,;]+", cc_part) if e.strip() and "@" in e]
+    else:
+        # No to:/cc: labels — treat everything as To
+        to_emails = [e.strip() for e in re.split(r"[,;\s]+", text) if e.strip() and "@" in e]
+        cc_emails = []
+
+    return {"to_emails": to_emails, "cc_emails": cc_emails}
+
+
 # ── Client report config update ───────────────────────────────────────────
 
 def _cfg_fleet_names(cfg: dict) -> list:
@@ -277,6 +310,8 @@ def _add_or_update_client_config(
     schedule_type: str = "daily",
     run_hour: Optional[int] = None,
     run_day: Optional[int] = None,
+    to_emails: Optional[list] = None,
+    cc_emails: Optional[list] = None,
 ) -> None:
     """Add or update an entry in client_report_config.json for Airflow scheduling.
 
@@ -331,6 +366,8 @@ def _add_or_update_client_config(
                 "schedule_type": schedule_type,
                 **({"run_hour": run_hour} if run_hour is not None else {}),
                 **({"run_day": run_day} if run_day is not None else {}),
+                "to_emails": to_emails if to_emails is not None else cfg.get("to_emails", []),
+                "cc_emails": cc_emails if cc_emails is not None else cfg.get("cc_emails", []),
             }
             updated = True
             break
@@ -343,6 +380,8 @@ def _add_or_update_client_config(
             "time_phrase": time_phrase,
             "timezone": timezone,
             "schedule_type": schedule_type,
+            "to_emails": to_emails or [],
+            "cc_emails": cc_emails or [],
         }
         if run_hour is not None:
             new_entry["run_hour"] = run_hour

@@ -227,6 +227,7 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
         item: str | None = None,
         sections_override: set | None = None,
         recipients: list | None = None,
+        cc_recipients: list | None = None,
     ) -> None:
         # sections_override (from client config) takes priority over NLU item
         sections = sections_override if sections_override is not None else _sections_for_item(item)
@@ -241,7 +242,7 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
             pdf_path, report_dir=project_root,
         )
         subject = f"Analytics Report - {fleet_name} - {time_phrase}"
-        send_report_email(pdf_path, subject, report_dir=project_root, recipients=recipients)
+        send_report_email(pdf_path, subject, report_dir=project_root, recipients=recipients, cc_recipients=cc_recipients)
 
     # Current run hour (used for per-client schedule matching)
     current_run_hour = reference_now.hour if reference_now else datetime.now().hour
@@ -333,13 +334,20 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
             timezone = (cfg.get("timezone") or default_tz).strip()
             sections = _sections_from_config(cfg.get("sections"))
 
+            # Per-schedule recipients take priority over the global airflow_recipients
+            cfg_to = cfg.get("to_emails") or []
+            cfg_cc = cfg.get("cc_emails") or []
+            eff_recipients  = cfg_to if cfg_to else airflow_recipients
+            eff_cc          = cfg_cc if cfg_cc else None
+
             if len(fleet_names_list) == 1:
                 # Single fleet — one report, existing behaviour
                 fleet_name = fleet_names_list[0]
                 logger.info("Running configured report: client=%s fleet=%s sections=%s", client_name, fleet_name, cfg.get("sections"))
                 await _fetch_and_send_one(
                     client_name, fleet_name, time_phrase, timezone,
-                    sections_override=sections, item=None, recipients=airflow_recipients,
+                    sections_override=sections, item=None,
+                    recipients=eff_recipients, cc_recipients=eff_cc,
                 )
             else:
                 # Multiple fleets — fetch each and send ONE combined report
@@ -367,7 +375,7 @@ def _run_scheduled_report(project_root: str, **kwargs) -> None:
                         time_phrase, combined_time_strings, pdf_path, report_dir=project_root,
                     )
                     subject = f"Analytics Report - {client_name} ({len(fleet_names_list)} fleets) - {time_phrase}"
-                    send_report_email(pdf_path, subject, report_dir=project_root, recipients=airflow_recipients)
+                    send_report_email(pdf_path, subject, report_dir=project_root, recipients=eff_recipients, cc_recipients=eff_cc)
 
             ran_any = True
 

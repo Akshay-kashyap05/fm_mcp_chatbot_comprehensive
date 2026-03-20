@@ -63,6 +63,7 @@ class ParsedQuery:
     timezone: Optional[str] = None
     time_phrase: Optional[str] = None
     client_from_text: bool = False  # True only when NLU found client in prompt (not from defaults)
+    unrecognized_metric: Optional[str] = None  # Ollama named a metric not in ALLOWED_ITEMS
 
 
 # Keywords that terminate a client/fleet name match
@@ -551,7 +552,8 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         '- "tug wise distance" or "bot wise distance" → {"intent":"basic_analytics_item","items":["sherpa_wise_distance"],...}\n'
         '- "tug wise trips" or "bot wise" or "per tug" → {"intent":"basic_analytics_item","items":["sherpa_wise_trips"],...}\n'
         '- "obstacle time" or "takt time" → use canonical names avg_obstacle_time / takt_time\n'
-        '- "route utilization" or "route usage" → {"intent":"basic_analytics_item","items":["route_utilization"],...}\n\n'
+        '- "route utilization" or "route usage" → {"intent":"basic_analytics_item","items":["route_utilization"],...}\n'
+        '- IMPORTANT: "utilization" alone (without "route") → fleet/sherpa utilization = {"intent":"basic_analytics_item","items":["utilization"],...} NOT route_utilization\n\n'
         "User text: "
         f"{text}\n"
     )
@@ -567,6 +569,8 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         if isinstance(raw_items, str):
             raw_items = [raw_items]
         valid_items = [i for i in raw_items if isinstance(i, str) and i in ALLOWED_ITEMS]
+        # Track items Ollama mentioned that aren't in our supported list
+        unrecognized = [i for i in raw_items if isinstance(i, str) and i.strip() and i not in ALLOWED_ITEMS]
 
         if len(valid_items) > 1:
             resolved_intent = "multi_metric"
@@ -585,6 +589,20 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
         if not use_items and hq.items:
             logger.debug("Ollama returned no items; falling back to heuristic items: %s", hq.items)
             use_items = hq.items
+
+        # Safety net 3: Prevent Ollama from upgrading plain "utilization" to "route_utilization"
+        # when the prompt does NOT contain "route". The heuristic only emits route_utilization
+        # when "route" is explicitly in the text, so if heuristic says "utilization", trust it.
+        if (
+            "route_utilization" in use_items
+            and "utilization" in hq.items
+            and "route_utilization" not in hq.items
+        ):
+            logger.info(
+                "Safety net 3: Ollama returned route_utilization but heuristic found plain utilization "
+                "— reverting to utilization"
+            )
+            use_items = ["utilization" if i == "route_utilization" else i for i in use_items]
 
         if len(use_items) > 1:
             resolved_intent = "multi_metric"
@@ -605,6 +623,8 @@ async def parse_query(text: str, defaults: Dict[str, str]) -> ParsedQuery:
             time_phrase=hq.time_phrase or obj.get("time_phrase"),
             # client_from_text always comes from heuristic — it reflects actual text extraction
             client_from_text=hq.client_from_text,
+            # Surface what Ollama named but we don't support (only when nothing valid was found)
+            unrecognized_metric=unrecognized[0] if unrecognized and not use_items else None,
         )
     except Exception as e:
         logger.warning("Ollama parse failed, falling back to heuristics: %s", e)

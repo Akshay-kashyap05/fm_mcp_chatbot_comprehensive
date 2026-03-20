@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from src.nlu import parse_query, ollama_pick_client
-from src.client_match import resolve_client, resolve_client_candidates, scan_prompt_for_client
+from src.client_match import resolve_client, resolve_client_candidates, scan_prompt_for_client, scan_prompt_for_client_candidates
 from src.scheduling import (
     CLIENT_REPORT_CONFIG_FILE,
     _DAY_NAMES,
@@ -26,6 +26,7 @@ from src.scheduling import (
     _load_pending_clarification,
     _load_pending_report,
     _load_pending_schedule,
+    _parse_email_recipients,
     _parse_schedule_command,
     _save_pending_clarification,
     _save_pending_report,
@@ -139,6 +140,55 @@ async def handle_chat(
         answer        = text.strip()
         _clear_pending_clarification()
         logger.info("Resuming from clarification: missing_field=%s, answer=%s", missing_field, answer)
+
+        # ── Email recipients: finalize the schedule with To/CC addresses ──────
+        if missing_field == "email_recipients":
+            sched_data   = partial_pq.get("pending_sched", {})
+            schedule     = partial_pq.get("schedule", {})
+            raw_fleet    = partial_pq.get("raw_fleet", "")
+            fleet_list   = partial_pq.get("fleet_list", [])
+            time_phrase  = partial_pq.get("time_phrase", "yesterday")
+            cadence_desc = partial_pq.get("cadence_desc", "")
+            sched_desc   = partial_pq.get("sched_desc", "")
+            fleet_label  = partial_pq.get("fleet_label", "")
+
+            parsed_emails = _parse_email_recipients(answer)
+            to_emails = parsed_emails["to_emails"]
+            cc_emails = parsed_emails["cc_emails"]
+
+            try:
+                for fl in fleet_list:
+                    _add_or_update_client_config(
+                        client_name=sched_data["client_name"],
+                        fleet_name=fl,
+                        time_phrase=time_phrase,
+                        timezone=sched_data.get("timezone", "Asia/Kolkata"),
+                        sections=sched_data.get("sections"),
+                        schedule_type=schedule["schedule_type"],
+                        run_hour=schedule.get("run_hour"),
+                        run_day=schedule.get("run_day"),
+                        to_emails=to_emails,
+                        cc_emails=cc_emails,
+                    )
+                _clear_pending_schedule()
+
+                email_desc = ""
+                if to_emails:
+                    email_desc = f"\n\n📧 **To:** {', '.join(to_emails)}"
+                if cc_emails:
+                    email_desc += f"\n📧 **CC:** {', '.join(cc_emails)}"
+                if not to_emails and not cc_emails:
+                    email_desc = "\n\nUsing the default recipient from `.env`."
+
+                return (
+                    f"Scheduled! Airflow will deliver the report for **{fleet_label}** **{sched_desc}**."
+                    + email_desc
+                    + f"\n\nThe `client_report_config.json` has been updated — "
+                    "you can change or remove the entries there at any time."
+                )
+            except Exception as e:
+                logger.warning("Failed to write schedule config: %s", e)
+                return f"Failed to save schedule: {e}"
 
         if missing_field == "client_name_confirm":
             # User is confirming (or correcting) a suggested client name
@@ -257,45 +307,47 @@ async def handle_chat(
         else:
             sched_type = schedule["schedule_type"]
             time_phrase = pending_sched.get("time_phrase") or _SCHEDULE_TIME_PHRASE.get(sched_type, "yesterday")
-            try:
-                # fleet_name may be comma-joined (multi-fleet) — create one entry per fleet
-                raw_fleet = pending_sched.get("fleet_name", "")
-                fleet_list = [f.strip() for f in raw_fleet.split(",") if f.strip()]
-                for fl in fleet_list:
-                    _add_or_update_client_config(
-                        client_name=pending_sched["client_name"],
-                        fleet_name=fl,
-                        time_phrase=time_phrase,
-                        timezone=pending_sched.get("timezone", "Asia/Kolkata"),
-                        sections=pending_sched.get("sections"),
-                        schedule_type=sched_type,
-                        run_hour=schedule.get("run_hour"),
-                        run_day=schedule.get("run_day"),
-                    )
-                _clear_pending_schedule()
 
-                if sched_type == "every_20min":
-                    cadence_desc = "every 20 minutes [testing mode]"
-                elif sched_type == "hourly":
-                    cadence_desc = "every hour"
-                elif sched_type == "daily":
-                    h = schedule.get("run_hour", datetime.now().hour)
-                    cadence_desc = f"every day at {h:02d}:00"
-                else:
-                    day_label = _DAY_NAMES[schedule.get("run_day", 0)]
-                    h = schedule.get("run_hour", datetime.now().hour)
-                    cadence_desc = f"every {day_label} at {h:02d}:00"
-                sched_desc = f"{cadence_desc} (data: {time_phrase})"
+            # fleet_name may be comma-joined (multi-fleet)
+            raw_fleet  = pending_sched.get("fleet_name", "")
+            fleet_list = [f.strip() for f in raw_fleet.split(",") if f.strip()]
 
-                fleet_label = raw_fleet if len(fleet_list) == 1 else ", ".join(fleet_list)
-                return (
-                    f"Scheduled! Airflow will deliver the report for **{fleet_label}** **{sched_desc}**.\n\n"
-                    f"The `client_report_config.json` has been updated — "
-                    f"you can change or remove the entries there at any time."
-                )
-            except Exception as e:
-                logger.warning("Failed to write schedule config: %s", e)
-                return f"Failed to save schedule: {e}"
+            if sched_type == "every_20min":
+                cadence_desc = "every 20 minutes [testing mode]"
+            elif sched_type == "hourly":
+                cadence_desc = "every hour"
+            elif sched_type == "daily":
+                h = schedule.get("run_hour", datetime.now().hour)
+                cadence_desc = f"every day at {h:02d}:00"
+            else:
+                day_label = _DAY_NAMES[schedule.get("run_day", 0)]
+                h = schedule.get("run_hour", datetime.now().hour)
+                cadence_desc = f"every {day_label} at {h:02d}:00"
+            sched_desc  = f"{cadence_desc} (data: {time_phrase})"
+            fleet_label = raw_fleet if len(fleet_list) == 1 else ", ".join(fleet_list)
+
+            # Ask for email recipients before saving config (Turn 4)
+            _save_pending_clarification(
+                missing_field="email_recipients",
+                partial_pq={
+                    "pending_sched":  dict(pending_sched),
+                    "schedule":       dict(schedule),
+                    "raw_fleet":      raw_fleet,
+                    "fleet_list":     fleet_list,
+                    "time_phrase":    time_phrase,
+                    "cadence_desc":   cadence_desc,
+                    "sched_desc":     sched_desc,
+                    "fleet_label":    fleet_label,
+                },
+            )
+            return (
+                f"Got it — **{fleet_label}** will be scheduled **{sched_desc}**.\n\n"
+                "**Who should receive this report?**\n\n"
+                "Provide **To** and optional **CC** email addresses:\n"
+                "- `to: manager@company.com` — single address\n"
+                "- `to: a@company.com, b@company.com cc: boss@company.com` — multiple\n"
+                "- `skip` — use the default recipient from `.env`\n"
+            )
 
     # ── Main query ────────────────────────────────────────────────────────
     try:
@@ -333,6 +385,19 @@ async def handle_chat(
             "Parsed query: intent=%s, item=%s, client=%s, fleet=%s, time_phrase=%s, sherpa_hint=%s",
             pq.intent, pq.item, pq.fm_client_name, pq.fleet_name, pq.time_phrase, pq.sherpa_hint,
         )
+
+        # If Ollama named a metric that isn't in our supported list AND the heuristic
+        # also found nothing → the user asked for something we don't support yet.
+        # Tell them clearly instead of silently returning the full analytics summary.
+        if pq.unrecognized_metric and not pq.items:
+            from src.nlu import ALLOWED_ITEMS as _ALLOWED
+            metric_label = pq.unrecognized_metric.replace("_", " ").title()
+            supported = ", ".join(sorted(_ALLOWED))
+            return (
+                f"**{metric_label}** is not currently a supported metric in this system.\n\n"
+                "Once it's added to the data pipeline it will appear here automatically.\n\n"
+                f"Supported metrics: {supported}"
+            )
 
         if pq.intent == "help":
             return """Sanjaya Analytics MCP Server
@@ -415,6 +480,33 @@ async def _execute_query(
                 logger.info("Correcting NLU swap: treating fleet_name '%s' as client_name", fleet_name)
                 client_name = swap_match.get("fm_client_name")
                 fleet_name = None
+
+        # ── Ambiguity check: even when sidebar has a specific client, ────────
+        # if the prompt text matches multiple clients at similar scores,
+        # ask the user to pick (e.g. "schneider electric" → Chino vs Chennai).
+        if sidebar_client:
+            ambig_candidates = scan_prompt_for_client_candidates(original_text, all_clients)
+            if len(ambig_candidates) >= 2:
+                options = [d.get("fm_client_name") for d, _ in ambig_candidates]
+                options_list = "\n".join(f"- `{n}`" for n in options)
+                _save_pending_clarification(
+                    missing_field="client_name",
+                    partial_pq={
+                        "intent":        pq.intent,
+                        "item":          pq.item,
+                        "items":         pq.items,
+                        "sherpa_hint":   pq.sherpa_hint,
+                        "fleet_name":    fleet_name,
+                        "timezone":      timezone,
+                        "time_phrase":   time_phrase,
+                        "original_text": original_text,
+                    },
+                )
+                return (
+                    f"I found multiple clients matching your query:\n\n"
+                    + options_list
+                    + "\n\nWhich one did you mean? Type the exact name."
+                )
 
         # Pre-resolution prompt scan: run when no sidebar client AND NLU didn't find a
         # client in the prompt text (pq.fm_client_name may just be the env default).
